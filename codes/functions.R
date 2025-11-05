@@ -1,0 +1,230 @@
+# About
+# In this script, I will define functions to be used for our work
+
+# Function to extract and filter drug datasets using an NDC filter
+extract_drug_name_data <- function(dataset_path, output_path = NULL, enrolid_filter = NULL, ndc_filter = NULL) {
+  
+  drug_data <- open_dataset(dataset_path) %>% 
+    select(ENROLID, NDCNUM, SVCDATE, YEAR, AGE, DAYSUPP)
+  
+  # Filter by ENROLID if provided.
+  if (!is.null(enrolid_filter)) {
+    drug_data <- drug_data %>% filter(ENROLID %in% enrolid_filter)
+  }
+  
+  # Filter by NDCNUM if provided.
+  if (!is.null(ndc_filter)) {
+    drug_data <- drug_data %>% filter(NDCNUM %in% ndc_filter)
+  }
+  
+  drug_data <- drug_data %>% collect() |> 
+    mutate(NDCNUM = as.character(NDCNUM), 
+           SVCDATE = as.Date(SVCDATE))
+  
+  dataset_names <- drug_data %>% 
+    left_join(redbook, by = "NDCNUM") %>%  
+    select(ENROLID, NDCNUM, SVCDATE, YEAR, AGE, DAYSUPP, THRDTDS, THERCLS, GENNME, MASTFRM, ROADS)
+  
+  # Only write to disk if an output_path is provided.
+  if (!is.null(output_path)) {
+    write_parquet(dataset_names, output_path)
+  }
+  
+  return(dataset_names)
+}
+
+
+#### Functions to extract drug NDC and search claims ####
+# Function to pull drug ndc for relevant drugs from redbook
+get_ndc_by_drug_name <- function(drug_string) {
+  redbook |> 
+    filter(str_detect(GENNME, drug_string)) |> 
+    distinct(NDCNUM) |> 
+    pull()
+}
+
+# Define a function to process and filter drug datasets using appropriate drug name as ndc filter
+extract_oac_drug_data <- function(dataset_path, output_path, ndc_filter) {
+  
+  drug_data <- open_dataset(dataset_path) |> 
+    select(c(ENROLID, NDCNUM, SVCDATE, YEAR, AGE, SEX, DAYSUPP))|>
+    to_duckdb() |> 
+    filter(NDCNUM %in% ndc_filter) |> 
+    collect()
+  
+  dataset_names <- drug_data |> 
+    left_join(redbook, by = "NDCNUM") |>  
+    select(c(ENROLID, NDCNUM, SVCDATE, YEAR, AGE, SEX, DAYSUPP, THRDTDS, GENNME, MASTFRM)) 
+  
+  # Save the processed dataset
+  write_parquet(dataset_names, output_path)
+  
+  return(dataset_names)
+}
+
+#############################
+
+##### Drug Data Cleaning ####
+# Function used to remove claims on the same date where negative and positive day's supply cancel out
+clean_canceling_claims <- function(data) {
+  
+  data |> 
+    arrange(ENROLID, SVCDATE, DAYSUPP) |> 
+    group_by(ENROLID, SVCDATE, GENNME) |> 
+    mutate(absolute_daysupp = abs(DAYSUPP)) |> 
+    filter(
+      !(DAYSUPP < 0 & absolute_daysupp %in% DAYSUPP[DAYSUPP > 0]) & 
+        !(DAYSUPP > 0 & absolute_daysupp %in% abs(DAYSUPP[DAYSUPP < 0]))
+    ) |> 
+    ungroup() |> 
+    select(-absolute_daysupp)
+}
+
+# Function used to remove sequential matching pairs of claims within 15 days
+remove_sequential_pairs <- function(data) {
+  data |> 
+    group_by(ENROLID, GENNME) |> 
+    arrange(ENROLID, GENNME, SVCDATE) |> 
+    mutate(
+      next_svdate = lead(SVCDATE),
+      next_daysupp = lead(DAYSUPP),
+      days_diff = as.numeric(difftime(next_svdate, SVCDATE, units = "days")),
+      to_remove = DAYSUPP > 0 & next_daysupp == -DAYSUPP & days_diff <= 15 # Mark rows to remove where a positive is followed by a canceling negative within 15 days
+    ) |> 
+    
+    filter(is.na(to_remove) | to_remove == FALSE) |>  # Filter out the marked rows and also their corresponding canceling negative rows
+    select(-next_svdate, -next_daysupp, -days_diff, -to_remove) %>%
+    ungroup() |> 
+    filter(DAYSUPP >= 0) # Remove remainder of negative claims as probably errant or without positive match
+  
+}
+
+# Function that selects max value if multiple fills occur on the same day
+select_max_fill <- function(data) {
+  data %>%
+    group_by(ENROLID, SVCDATE, GENNME) %>%
+    slice_max(order_by = coalesce(DAYSUPP, -Inf),
+                     n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    select(-NDCNUM) %>%
+    distinct()
+}
+
+###################
+
+#### Functions to Assign Index and Apply Rules for Entry ####
+# Function to calculate drug end date with grace period
+calculate_drug_end_plus_grace <- function(data, adherence_multiplier, cap = 30) {
+  data |> 
+    arrange(ENROLID, SVCDATE) |> 
+    mutate(
+      grace_days = round(pmin(DAYSUPP * adherence_multiplier, cap)),
+      drug_end_plus_grace = SVCDATE + DAYSUPP - 1 + grace_days
+    )
+}
+
+
+# Function to flag gaps between fills of same drug and assign tx episode number
+flag_gaps_and_assign_episodes <- function(data, gap_allowed) {
+  data |> 
+    group_by(ENROLID) |> 
+    mutate(
+      days_since_last = as.numeric(difftime(SVCDATE, lag(drug_end_plus_grace, default = first(SVCDATE)), units = "days")), 
+      gap_flag = if_else(is.na(days_since_last) | days_since_last > gap_allowed, 1, 0), 
+      episode_number = cumsum(gap_flag)
+    ) |> 
+    ungroup()
+}
+
+# Function to assign index date, age at index, and index medication
+assign_index_date_and_med <- function(data) {
+  data |> 
+    group_by(ENROLID, episode_number) |> 
+    mutate(
+      index_date = min(SVCDATE), 
+      age_at_index = first(AGE), 
+      index_med = if_else(SVCDATE == index_date, GENNME, NA)
+    ) |> 
+    fill(index_med, .direction = "down") |> 
+    ungroup() |> 
+    mutate(oac_switch = if_else(GENNME == index_med, "match", "switch"))
+}
+
+# Function to filter by date for new users, and meeting age criteria
+filter_new_users_age <- function(data, earliest_index_date, age_criteria) {
+  data |> 
+    filter(
+      index_date > as.Date(earliest_index_date), 
+      !is.na(age_at_index), 
+      age_at_index >= age_criteria
+    )
+}
+
+################################
+
+
+
+#### Continuous Enrollment Function ####
+
+#' Apply continuous enrollment function
+#'
+#' @description
+#' `ContinuousEnrollment()` is developed to extract individuals who are continuously enrolled over a certain period of time in claims databases.
+#' The function only works on enrollment datasets generated by [arrow::open_dataset()]
+#'
+#' @param enrollment_data An arrow dataset. The dataset must have at least 3 columns: The individual ID (`ENROLID`), start of enrollment date (`DTSTART`),
+#' and end of enrollment date (`DTEND`).
+#' @param data A tibble or data frame containing at least two columns: The individual ID (`ENROLID`) and a column for the index date (specified in the `index_date_var` argument)
+#' @param days_after Number of days of continuous enrollment after the index date.
+#' @param days_before Number of days of continuous enrollment before the index date.
+#' @param max_gap Number of gap days allowed
+#' @param index_date_var The name of the variable indicating the index date
+#'
+#' @return The output will have the same columns as the input `data`, but with excluding patients who were not continuously enrolled based on the user's specification.
+#' @export
+#'
+ContinuousEnrollment <- function(
+    enrollment_data,
+    data,
+    days_after = 0,
+    days_before,
+    max_gap = 0,
+    index_date_var
+)
+{
+  suppressMessages(
+    suppressWarnings(
+      a <-  enrollment_data |>
+        select(ENROLID, DTSTART, DTEND) |>
+        filter(ENROLID %in% unique(data$ENROLID)) |>
+        to_duckdb() |>
+        arrange(ENROLID, DTSTART) |>
+        group_by(ENROLID) |>
+        mutate(
+          raw_diff = as.integer(DTSTART - lag(DTEND)) - 1, 
+          gap_days = if_else(raw_diff > 0, raw_diff, 0), 
+          continuous_cov_start = if_else(gap_days > max_gap | is.na(gap_days), DTSTART, NA)) |>
+        mutate(cont_enrol = if_else(is.na(continuous_cov_start),0,1)) |>
+        mutate(episode = cumsum(cont_enrol)) |>
+        group_by(ENROLID, episode) |>
+        summarise(start_cont_enrol = min(DTSTART),
+                  end_cont_enrol = max(DTEND), 
+                  .groups = "drop") |>
+        collect()
+    )
+  )
+  suppressMessages(
+    suppressWarnings(
+      b <- data |>
+        mutate(pre_cont_enrol_period_begin = {{index_date_var}} - days_before) |>
+        mutate(post_cont_enrol_period_end = {{index_date_var}} + days_after) |>
+        left_join(a, by = "ENROLID") |>
+        arrange(ENROLID) |>
+        filter(interval(pre_cont_enrol_period_begin, {{index_date_var}}) %within% interval(start_cont_enrol, end_cont_enrol),
+               interval({{index_date_var}}, post_cont_enrol_period_end) %within% interval(start_cont_enrol, end_cont_enrol)
+        ) |>
+        select(-c(pre_cont_enrol_period_begin, post_cont_enrol_period_end, episode, start_cont_enrol, end_cont_enrol))
+    )
+  )
+  return(b)
+}
