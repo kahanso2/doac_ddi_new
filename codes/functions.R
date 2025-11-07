@@ -228,3 +228,23 @@ ContinuousEnrollment <- function(
   )
   return(b)
 }
+
+
+canon_oac <- function(x) {
+  x0 <- x %>%
+    str_to_lower() %>%
+    str_remove_all("\\[.*?\\]") %>%                 # strip bracketed brand
+    str_remove_all("\\b\\d+(?:\\.\\d+)?\\s*(mg|mcg|g|mg/ml|mg\\/ml|ml)\\b") %>%
+    str_remove_all("\\b(oral|tablet|tab|capsule|cap|solution|suspension|inj(?:ection)?|prefilled|syringe|topical|patch|er|xr|dr|cr)\\b") %>%
+    str_replace_all("[;:]+", " ") %>%
+    str_squish()
+  
+  case_when(
+    str_detect(x0, "apixaban")                              ~ "Apixaban",
+    str_detect(x0, "rivaroxaban")                           ~ "Rivaroxaban",
+    str_detect(x0, "edoxaban")                              ~ "Edoxaban",
+    str_detect(x0, "dabigatran")                            ~ "Dabigatran",  # covers “dabigatran etexilate (mesylate)”
+    str_detect(x0, "warfarin")                              ~ "Warfarin",    # covers “warfarin sodium”
+    TRUE                                                             ~ str_to_title(x0)
+  )
+}
