@@ -230,21 +230,23 @@ ContinuousEnrollment <- function(
 }
 
 
-canon_oac <- function(x) {
+# Generic cleaner + mapper for any drug family (OACs + lisinopril)
+canon_drug <- function(x) {
   x0 <- x %>%
-    str_to_lower() %>%
-    str_remove_all("\\[.*?\\]") %>%                 # strip bracketed brand
-    str_remove_all("\\b\\d+(?:\\.\\d+)?\\s*(mg|mcg|g|mg/ml|mg\\/ml|ml)\\b") %>%
-    str_remove_all("\\b(oral|tablet|tab|capsule|cap|solution|suspension|inj(?:ection)?|prefilled|syringe|topical|patch|er|xr|dr|cr)\\b") %>%
-    str_replace_all("[;:]+", " ") %>%
-    str_squish()
+    stringr::str_to_lower() %>%
+    stringr::str_remove_all("\\[.*?\\]") %>%  # strip bracketed brand
+    stringr::str_remove_all("\\b\\d+(?:\\.\\d+)?\\s*(mg|mcg|g|mg/ml|mg\\/ml|ml)\\b") %>%
+    stringr::str_remove_all("\\b(oral|tablet|tab|capsule|cap|solution|suspension|inj(?:ection)?|prefilled|syringe|topical|patch|er|xr|dr|cr)\\b") %>%
+    stringr::str_replace_all("[;:]+", " ") %>%
+    stringr::str_squish()
   
-  case_when(
-    str_detect(x0, "apixaban")                              ~ "Apixaban",
-    str_detect(x0, "rivaroxaban")                           ~ "Rivaroxaban",
-    str_detect(x0, "edoxaban")                              ~ "Edoxaban",
-    str_detect(x0, "dabigatran")                            ~ "Dabigatran",  # covers “dabigatran etexilate (mesylate)”
-    str_detect(x0, "warfarin")                              ~ "Warfarin",    # covers “warfarin sodium”
-    TRUE                                                             ~ str_to_title(x0)
+  dplyr::case_when(
+    stringr::str_detect(x0, "apixaban")    ~ "Apixaban",
+    stringr::str_detect(x0, "rivaroxaban") ~ "Rivaroxaban",
+    stringr::str_detect(x0, "edoxaban")    ~ "Edoxaban",
+    stringr::str_detect(x0, "dabigatran")  ~ "Dabigatran",
+    stringr::str_detect(x0, "warfarin")    ~ "Warfarin",
+    stringr::str_detect(x0, "lisinopril")  ~ "Lisinopril",   # add the negative control here
+    TRUE ~ stringr::str_to_title(x0)
   )
 }

@@ -1,0 +1,2268 @@
+---
+title: "Lisinopril Cohort"
+author: "Kent Hanson"
+format: html
+editor: visual
+---
+
+#To Do
+
+The goal of this analysis is to explore DDI in CVD using the SCCS as a high-throughput screening technique
+
+# Packages
+
+```{r}
+#| label: load-packages/functions
+#| include: false
+
+proj_root <- "C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new"
+
+pacman::p_load(tidyverse, arrow, duckdb, tictoc, haven, reshape2, lubridate, SCCS, janitor, fs, here, AdhereR, remotes, lme4, gnm, survival, grid, forestploter, duckplyr,  data.table, progress, readxl, zoo, msm, httr, jsonlite, gt, dbplyr)
+
+# Call functions
+source(here("codes/functions.R"))
+source(here("codes/codes.R"))
+
+# Load + split into raw vs. clean NDC11-only
+redbook_raw <- open_dataset("//pharm-c-psop/TruvenData/Truven Data R/redbook.parquet") |>
+  mutate(NDCNUM = as.character(NDCNUM)) |>
+  collect()
+
+redbook <- redbook_raw |>
+  mutate(ndc11_ok = grepl("^[0-9]{11}$", NDCNUM)) |>
+  filter(ndc11_ok) |>
+  select(-ndc11_ok)
+
+options(scipen = 999)
+
+oac_drug_list <- c("Warf", "Apix", "Rivarox", "Dabig", "Edoxa")
+neg_control <- "Lisinopril"
+
+
+```
+
+# Clean Drug Data File by Updating Blank NDCs from RxNorm API
+
+```{r}
+
+# Read distinct NDC numbers from CCAE & MDCR datasets then bind
+all_ccae_ndc <- open_dataset("//pharm-c-psop/TruvenData/Truven Data R/ccae/d") |> 
+  select(NDCNUM) |> 
+  distinct(NDCNUM) |> 
+  collect()
+
+all_mdcr_ndc <- open_dataset("//pharm-c-psop/TruvenData/Truven Data R/mdcr/d") |> 
+  select(NDCNUM) |> 
+  distinct(NDCNUM) |> 
+  collect()
+
+full_ndc <- bind_rows(all_ccae_ndc, all_mdcr_ndc) |> 
+  distinct(NDCNUM) |> 
+  filter(!is.na(NDCNUM)) |>
+  filter(grepl("^[0-9]{11}$", NDCNUM)) |>   # keep only plausible 11-digit, digits-only NDCs
+  distinct(NDCNUM)
+
+
+# Join the NDC numbers to Redbook and identify NDC with no GENNME
+id_blank_GENNME <- full_ndc |> 
+  left_join(redbook, by = "NDCNUM") |> 
+  select(NDCNUM, GENNME, MSTFMDS, MASTFRM, ROADS, DEACLDS, THRDTDS, THERCLS) |> 
+  filter(is.na(GENNME)) |> 
+  distinct(NDCNUM, .keep_all = TRUE)
+
+
+# Define a function to get the generic name for an NDC codefrom RxNorm API
+
+# lightweight memoized cache so repeated NDCs aren’t re-fetched
+.ndc_cache <- new.env(parent = emptyenv())
+
+get_generic_name <- function(ndc) {
+  if (is.na(ndc) || ndc == "" || is.null(ndc)) return(NA_character_)
+  if (exists(ndc, envir = .ndc_cache, inherits = FALSE))
+    return(get(ndc, envir = .ndc_cache, inherits = FALSE))
+  
+  url <- paste0("https://rxnav.nlm.nih.gov/REST/ndcstatus.json?ndc=", ndc)
+  
+   for (attempt in 1:2) {
+    resp <- try(httr::GET(url, httr::timeout(10)), silent = TRUE)
+    if (!inherits(resp, "try-error") && httr::status_code(resp) == 200) {
+      txt <- try(httr::content(resp, "text", encoding = "UTF-8"), silent = TRUE)
+      if (!inherits(txt, "try-error") && !is.null(txt)) {
+        dat <- try(jsonlite::fromJSON(txt), silent = TRUE)
+        if (!inherits(dat, "try-error")) {
+          val <- dat$ndcStatus$conceptName
+          out <- if (is.null(val) || length(val) == 0) NA_character_ else as.character(val[1])
+          assign(ndc, out, envir = .ndc_cache)
+          return(out)
+        }
+      }
+    }
+    # brief backoff on first failure
+    if (attempt == 1) Sys.sleep(0.3)
+  }
+
+  assign(ndc, NA_character_, envir = .ndc_cache)
+  NA_character_
+}
+
+# Uncomment the lines below to test the function: 
+# example_ndc <- "67544009794"  # Replace with NDC code
+# generic_name <- get_generic_name(example_ndc)
+
+# Retrieve generic names for NDCs with missing GENNME from redbook & convert to title case
+id_blank_GENNME$generic_name <- vapply(id_blank_GENNME$NDCNUM, get_generic_name, FUN.VALUE = NA_character_) |> 
+  str_to_title()
+
+# Add a 'route' column based on keywords in the generic name
+id_blank_GENNME_added <- id_blank_GENNME |> 
+  mutate(
+    route = case_when(
+      str_detect(generic_name, "Oral|Tablet|Capsule|Chewable") ~ "Oral",
+      str_detect(generic_name, "Topical|Lotion|Cream") ~ "Topical application",
+      str_detect(generic_name, "Injectable|Prefilled Syringe|Injection") ~ "Injectable",
+      str_detect(generic_name, "Transdermal") ~ "Transdermal",
+      str_detect(generic_name, "Ophthalmic") ~ "Ophthalmic",
+      str_detect(generic_name, "Otic") ~ "Otic",
+      TRUE ~ NA_character_  # Default to NA if no conditions are met
+    ) 
+  ) |> 
+  transmute(NDCNUM, generic_name = as.character(generic_name), route)
+
+# id_blank_GENNME_added |> write_parquet(file.path(proj_root, "data", "id_blank_GENNME_added.parquet"))
+
+# Filter the cleaned dataset for rows where the generic name matches one of the OAC drugs
+blank_oac_ndc <- id_blank_GENNME_added |> 
+  mutate(oac_flag = str_detect(generic_name, regex(str_c(oac_drug_list, collapse = "|"), ignore_case = TRUE))) |>
+  filter(oac_flag) |> # only includes warfarin rx
+  pull(NDCNUM) 
+
+# Repeat for neg_con
+blank_neg_con_ndc <- id_blank_GENNME_added |> 
+  mutate(neg_con_flag = str_detect(generic_name, regex(str_c(neg_control, collapse = "|"), ignore_case = TRUE))) |>
+  filter(neg_con_flag, !str_detect(generic_name, "Hctz|Hydrochlorothiazide|/")) |> 
+  pull(NDCNUM) 
+
+# Function to pull drug ndc for relevant drugs from redbook by matching generic names
+get_ndc_by_drug_name <- function(drug_list, extra_ndcs) {
+  redbook_ndcs <- redbook |> 
+    filter(str_detect(GENNME, regex(str_c(drug_list, collapse = "|"), ignore_case = TRUE))) |> 
+    distinct(NDCNUM) |> 
+    pull()
+  
+  # Combine redbook NDCs with those from blank_oac_ndc vector above
+  all_ndcs <- unique(c(as.character(redbook_ndcs), as.character(extra_ndcs)))
+  
+  all_ndcs[grepl("^[0-9]{11}$", all_ndcs)] # limits to ndcs 11 digits long composed of numbers only
+
+}
+
+# Get the unified OAC NDC vector
+oac_ndc <- get_ndc_by_drug_name(oac_drug_list, blank_oac_ndc)
+neg_con_ndc <- get_ndc_by_drug_name(neg_control, blank_neg_con_ndc)
+
+# Save Vectors
+saveRDS(oac_ndc, file.path(proj_root, "data","oac_ndc.rds"))
+saveRDS(neg_con_ndc, file.path(proj_root, "data","neg_con_ndc.rds"))
+
+# Load vectors
+# oac_ndc <- readRDS(file.path(proj_root, "data", "oac_ndc.rds"))
+# neg_con_ndc <- readRDS(file.path(proj_root, "data", "neg_con_ndc.rds"))
+
+```
+
+# OAC Drug Data
+
+```{r}
+# Use extract_drug_name_data function to pull data for oac cohort (i.e., full oac drug use)
+
+ccaed_oac_2009_2021 <- extract_drug_name_data(
+  dataset_path = "//pharm-c-psop/TruvenData/Truven Data R/ccae/d", 
+  output_path = file.path(proj_root, "data", "ccaed_oac_2009_2021.parquet"), 
+  enrolid_filter = NULL,
+  ndc_filter = oac_ndc
+)
+
+mdcrd_oac_2009_2021 <- extract_drug_name_data(
+  dataset_path = "//pharm-c-psop/TruvenData/Truven Data R/mdcr/d", 
+  output_path = file.path(proj_root, "data", "mdcrd_oac_2009_2021.parquet"), 
+  enrolid_filter = NULL,
+  ndc_filter = oac_ndc)
+
+# Bind drug files from CCAE and MDCR
+all_drug_oac <- bind_rows(ccaed_oac_2009_2021, mdcrd_oac_2009_2021) # 29,015,802 observations
+
+
+# Merge in blank drug names from above
+all_drug_oac_2009_2021 <- all_drug_oac |>
+  filter(!is.na(ENROLID)) |>
+  left_join(id_blank_GENNME_added, by = "NDCNUM") |>
+  mutate(GENNME = if_else(is.na(GENNME), generic_name, GENNME)) |>
+  select(-generic_name) |>
+  mutate(GENNME = canon_drug(GENNME))
+
+
+# Save dataset so don't have to do that again
+all_drug_oac_2009_2021 |> write_parquet(file.path(proj_root, "data", "all_drug_oac_2009_2021.parquet"))
+
+#### CODE TO OPEN DATASET WITHOUT RUNNING ABOVE ####
+
+# Open dataset
+# all_drug_oac_2009_2021 <- read_parquet(file.path(proj_root, "data", "all_drug_oac_2009_2021.parquet"))
+
+# Save unique IDs of oac users
+all_oac_users <- unique(all_drug_oac_2009_2021$ENROLID) # 2,360,604 users
+
+```
+
+# Negative Control Data
+
+```{r}
+# Use extract_drug_name_data function to pull data for oac cohort (i.e., full oac drug use)
+
+ccaed_neg_con_2009_2021 <- extract_drug_name_data(
+  dataset_path = "//pharm-c-psop/TruvenData/Truven Data R/ccae/d", 
+  output_path = file.path(proj_root, "data", "ccaed_neg_con_2009_2021.parquet"), 
+  enrolid_filter = NULL,
+  ndc_filter = neg_con_ndc
+)
+
+mdcrd_neg_con_2009_2021 <- extract_drug_name_data(
+  dataset_path = "//pharm-c-psop/TruvenData/Truven Data R/mdcr/d", 
+  output_path = file.path(proj_root, "data", "mdcrd_neg_con_2009_2021.parquet"), 
+  enrolid_filter = NULL,
+  ndc_filter = neg_con_ndc)
+
+# Bind drug files from CCAE and MDCR
+all_drug_neg_con <- bind_rows(ccaed_neg_con_2009_2021, mdcrd_neg_con_2009_2021) #  observations
+
+###see if canon needed
+# Merge in blank drug names from above
+all_drug_neg_con_2009_2021 <- all_drug_neg_con |>
+  filter(!is.na(ENROLID)) |>
+  left_join(id_blank_GENNME_added, by = "NDCNUM") |>
+  mutate(GENNME = if_else(is.na(GENNME), generic_name, GENNME)) |>
+  select(-generic_name) |>
+  mutate(GENNME = canon_drug(GENNME))
+
+
+# Save dataset so don't have to do that again
+all_drug_neg_con_2009_2021 |> write_parquet(file.path(proj_root, "data", "all_drug_neg_con_2009_2021.parquet"))
+
+#### CODE TO OPEN DATASET WITHOUT RUNNING ABOVE ####
+
+# Open dataset
+# all_drug_neg_con_2009_2021 <- read_parquet(file.path(proj_root, "data", "all_drug_neg_con_2009_2021.parquet"))
+
+# Save unique IDs of oac users
+all_neg_con_users <- unique(all_drug_neg_con_2009_2021$ENROLID) # 10,334,932 users
+
+
+```
+
+
+# Clean Drug Data
+```{r}
+# ===========================
+# Drug-data cleaning — data.table (pairwise cancels + nearest future − within 15 days)
+# ===========================
+# 1) SAME-DAY cancels: remove +x/−x in PAIRS within (ENROLID, GENNME, SVCDATE, |DAYSUPP|).
+#    If there are extra unmatched fills (e.g., +10,+10 and −10), keep the leftover (+10).
+# 2) SEQUENTIAL cancels: for each positive +x, find the NEAREST future negative −x within 15 days.
+#    Match each negative at most once; drop both sides of each matched pair.
+# 3) Max-per-day: among remaining fills on the same day, keep the row with the largest DAYSUPP.
+#
+# ===========================
+
+clean_drug_data_dt <- function(df) {
+  # ---- 0) Convert to data.table and use efficient types ----
+  dt <- as.data.table(df)[
+    , .(
+      ENROLID,
+      GENNME,
+      SVCDATE = as.IDate(SVCDATE),   # IDate = integer-backed Date → cheap joins/arithmetic
+      DAYSUPP = as.integer(DAYSUPP), # int is smaller/faster than double for day counts
+      AGE,
+      NDCNUM
+    )
+  ]
+
+  # Optional: use all CPU threads for speed
+  setDTthreads(percent = 100)
+
+  # Stable row id so we can drop exact rows later
+  dt[, id := .I]
+
+  # Precompute helpers once (avoid recomputing in filters)
+  dt[, amt  := abs(DAYSUPP)]                                      # |days supply|
+  dt[, sign := fifelse(DAYSUPP > 0L, 1L, fifelse(DAYSUPP < 0L, -1L, 0L))]  # +1 / -1 / 0
+
+  # ---- 1) SAME-DAY PAIRWISE cancels (+x with −x on the same day and same |amt|) ----
+  # Group is (person, drug, service date, |days|)
+  dt[, n_pos := sum(sign == 1L),  by = .(ENROLID, GENNME, SVCDATE, amt)]   # how many + in group
+  dt[, n_neg := sum(sign == -1L), by = .(ENROLID, GENNME, SVCDATE, amt)]   # how many − in group
+
+  # Row number WITHIN each (group × sign) so we can remove only min(n_pos, n_neg) rows from both sides
+  dt[, k := rowid(ENROLID, GENNME, SVCDATE, amt, sign)]
+
+  # Mark rows to drop if they are within the first min(n_pos, n_neg) of their sign (pairwise removal)
+  dt[, to_drop_same_day := (sign != 0L) & (k <= pmin(n_pos, n_neg))]
+
+  # Keep everything NOT marked for same-day pairwise drop (explicit boolean in i avoids the single-symbol gotcha)
+  dt1 <- dt[to_drop_same_day == FALSE,
+            .(id, ENROLID, GENNME, SVCDATE, DAYSUPP, AGE, NDCNUM, amt, sign)]
+
+  # ---- 2) SEQUENTIAL cancels within 15 days (nearest future −x; each − used once) ----
+  # Split into positives and negatives with minimal columns for the join
+  pos <- dt1[sign == 1L, .(id, ENROLID, GENNME, amt, SVCDATE)]
+  neg <- dt1[sign == -1L, .(id, ENROLID, GENNME, amt, SVCDATE)]
+
+  # Build intervals: positives search window is [date, date+15]; negatives are point events [date, date]
+  pos[, `:=`(start = SVCDATE, end = SVCDATE + 15L)]
+  neg[, `:=`(start = SVCDATE, end = SVCDATE)]
+
+  # Keys (sorted indexes) speed up the interval join
+  setkey(pos, ENROLID, GENNME, amt, start, end)
+  setkey(neg, ENROLID, GENNME, amt, start, end)
+
+  # Interval overlap join: match − rows that fall inside each + row’s [date, date+15] window
+  ov <- foverlaps(pos, neg, nomatch = 0L)
+
+  # Keep only future/same-day negatives (exclude past cancels)
+  # (In overlap result, columns from 'pos' get 'i.' prefix; 'start' is from neg here.)
+  ov <- ov[(i.start - start) >= 0L]
+
+  # For each positive id, choose the nearest negative (earliest ndate)
+  setorder(ov, id, i.SVCDATE)         # 'id' is pos id; 'i.SVCDATE' is neg date
+  ov1 <- ov[!duplicated(id)]          # keep first match per positive
+
+  # Ensure each negative is used at most once (greedy: earliest pos wins)
+  setorder(ov1, i.id, SVCDATE)        # 'i.id' is neg id; 'SVCDATE' is pos date
+  pairs <- ov1[!duplicated(i.id)]
+
+  # Drop BOTH sides of each matched pair
+  drop_ids <- c(pairs$id, pairs$i.id)
+  dt2 <- dt1[!id %in% drop_ids]
+
+  # ---- 3) If multiple fills remain on same day, keep max DAYSUPP ----
+  # Also remove any leftover negatives just in case (should be rare at this point)
+  cleaned <- dt2[DAYSUPP >= 0L][
+    order(ENROLID, GENNME, SVCDATE, -DAYSUPP, id)   # put max DAYSUPP first per day
+  ][
+    , .SD[1L], by = .(ENROLID, GENNME, SVCDATE)     # take first row per group (= max)
+  ][
+    , .(ENROLID, GENNME, SVCDATE, DAYSUPP, AGE)          # final columns (drop NDCNUM per your original)
+  ]
+
+  cleaned
+}
+
+cleaned_drug_data <- clean_drug_data_dt(all_drug_neg_con_2009_2021)
+
+# ── Save dataset so we don't have to redo ───────────────────────────────────────
+write_parquet(cleaned_drug_data, file.path(proj_root, "data", "control", "cleaned_drug_data.parquet"))
+
+# Open dataset later without rerunning cleaning ────────────────────
+# cleaned_drug_data <- read_parquet(cleaned_drug_data, file.path(proj_root, "data", "control", "cleaned_drug_data.parquet"))
+```
+
+# Test - Assign Index Date - works, but need to compare with other code, which can only be done on OAC. In OAC need to gorup by GENNME I think (see ChatGPT) "Optimize data cleaning"
+```{r}
+library(data.table)
+
+# ==========================================================
+# Post-clean steps in data.table (scales to 100M+ rows)
+#  - Calculates drug_end_plus_grace with cap (grace = (1 - adherence) * DAYSUPP)
+#  - Flags gaps and assigns episode numbers
+#  - Assigns index_date / age_at_index / index_med
+#  - Filters for new users and age criteria
+# ----------------------------------------------------------
+# Requirements:
+#   SVCDATE  : IDate or Date (coerced to IDate)
+#   DAYSUPP  : integer
+#   GENNME   : character/factor drug name
+#   ENROLID  : beneficiary id
+#   AGE      : age at each row (or at least present for index rows)
+# Output columns added:
+#   grace_days, drug_end_plus_grace, days_since_last, gap_flag, episode_number,
+#   index_date, age_at_index, index_med, oac_switch
+# ==========================================================
+
+postclean_assign_rules_dt <- function(df,
+                                      adherence_multiplier,       # adherence proportion in [0,1], e.g., 0.70
+                                      cap = 30L,
+                                      gap_allowed = 30L,
+                                      earliest_index_date = as.IDate("2009-07-01"),
+                                      age_criteria = 18L,
+                                      by_drug = TRUE) {
+
+  # ---- 0) Coerce to data.table & fast types ----
+  dt <- as.data.table(df)
+  if (!inherits(dt$SVCDATE, "IDate")) dt[, SVCDATE := as.IDate(SVCDATE)]
+  if (!is.integer(dt$DAYSUPP))        dt[, DAYSUPP := as.integer(DAYSUPP)]
+  if (!"AGE" %in% names(dt))          dt[, AGE := NA_integer_]  # be tolerant if AGE missing
+  if (!is.integer(cap))               cap <- as.integer(cap)
+  if (!is.integer(gap_allowed))       gap_allowed <- as.integer(gap_allowed)
+  if (!inherits(earliest_index_date, "IDate")) earliest_index_date <- as.IDate(earliest_index_date)
+
+  # Validate adherence arg (intend proportion)
+  if (is.na(adherence_multiplier) || adherence_multiplier < 0 || adherence_multiplier > 1) {
+    stop("adherence_multiplier should be an adherence proportion in [0,1], e.g., 0.70")
+  }
+
+  # Keep things deterministically ordered for "first" / fills
+  setorder(dt, ENROLID, GENNME, SVCDATE)
+
+  # ---- 1) calculate_drug_end_plus_grace ----
+  # grace = (1 - adherence) * DAYSUPP, capped by `cap` (cap applies to grace only)
+  dt[, grace_raw  := as.integer(round(DAYSUPP * (1 - adherence_multiplier)))]
+  dt[, grace_days := pmin(grace_raw, cap)]
+  dt[, drug_end_plus_grace := SVCDATE + (DAYSUPP - 1L) + grace_days]
+  dt[, grace_raw := NULL]
+
+  # ---- 2) flag_gaps_and_assign_episodes ----
+  # Grouping level: per-drug (default) or any-drug
+  grp <- if (isTRUE(by_drug)) c("ENROLID", "GENNME") else c("ENROLID")
+
+  # Deterministic ordering (dynamic)
+  cols <- c("ENROLID", if (isTRUE(by_drug)) "GENNME", "SVCDATE")
+  setorderv(dt, cols)
+
+  # Previous end within group; ensure the first row starts an episode
+  dt[, prev_end := shift(drug_end_plus_grace), by = grp]
+  dt[, anchor   := SVCDATE[1L],               by = grp]                      # first date in group
+  dt[, eff_prev := fifelse(is.na(prev_end), anchor, prev_end)]
+  dt[, days_since_last := as.integer(SVCDATE - eff_prev)]
+  dt[, gap_flag := fifelse(is.na(days_since_last) | (days_since_last > gap_allowed), 1L, 0L)]
+  dt[, episode_number := cumsum(gap_flag), by = grp]
+  dt[, c("prev_end","anchor","eff_prev") := NULL]
+
+  # ---- 3) assign_index_date_and_med ----
+  # Within each (ENROLID, episode_number):
+  #   index_date   = first SVCDATE
+  #   age_at_index = first AGE
+  #   index_med    = GENNME of first row in episode (deterministic given sort)
+  #   oac_switch   = "match" if GENNME == index_med else "switch"
+  setorder(dt, ENROLID, episode_number, SVCDATE)
+  dt[, index_date   := SVCDATE[1L], by = .(ENROLID, episode_number)]
+  dt[, age_at_index := AGE[1L],     by = .(ENROLID, episode_number)]
+  dt[, index_med    := GENNME[1L],  by = .(ENROLID, episode_number)]
+  # If you prefer tie-break by max DAYSUPP on the index day, use:
+  # dt[, index_med := GENNME[order(SVCDATE, -DAYSUPP)][1L], by = .(ENROLID, episode_number)]
+
+  dt[, oac_switch := fifelse(GENNME == index_med, "match", "switch")]
+
+  # ---- 4) filter_new_users_age ----
+  dt <- dt[index_date > earliest_index_date &
+             !is.na(age_at_index) &
+             age_at_index >= as.integer(age_criteria)]
+
+  # Return in a tidy order
+  setorder(dt, ENROLID, episode_number, SVCDATE)
+  dt[]
+}
+
+# ======================
+# Example usage:
+# (Assuming `cleaned_drug_data` from your earlier cleaner that retains AGE)
+final_dt <- postclean_assign_rules_dt(
+  cleaned_drug_data,
+  adherence_multiplier = 0.70,   # 70% adherent -> grace = 30% of DAYSUPP (capped by `cap`)
+  cap = 30L,
+  gap_allowed = 30L,
+  earliest_index_date = "2009-07-01",
+  age_criteria = 18L,
+  by_drug = TRUE                 # gaps per drug (recommended)
+)
+
+
+
+```
+
+# Assign Index Date
+
+```{r}
+
+#Apply functions to create index dates and age-eligible population
+all_neg_con_index <- cleaned_drug_data |> 
+  arrange(ENROLID, SVCDATE) |> 
+  calculate_drug_end_plus_grace(adherence_multiplier = 0.3, cap = 30) |> 
+  flag_gaps_and_assign_episodes(gap_allowed = 183) |> 
+  assign_index_date_and_med() |> 
+  filter_new_users_age(earliest_index_date = '2009-07-02', age_criteria = 18)
+
+
+# ── Exclude patients with ≥2 distinct OACs on the *index date* ────────────────
+# Index date is the first OAC fill. We look only at fills on that date and count distinct OAC names.
+
+
+ambiguous_ids <- all_neg_con_index |>
+  filter(GENNME %in% neg_control, SVCDATE == index_date) |>
+  group_by(ENROLID, episode_number, index_date) |>
+  summarise(n_neg_control = n_distinct(GENNME), .groups = "drop") |>
+  filter(n_neg_control >= 2) |>
+  distinct(ENROLID) |>
+  pull()
+
+message("Excluding ", length(unique(ambiguous_ids)),
+        " patients with multiple distinct OACs on their index date.")
+
+all_oac_index <- all_oac_index |>
+  filter(!ENROLID %in% ambiguous_ids)
+  
+# Save dataset so don't have to do that again
+all_oac_index |> write_parquet("C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/all_oac_index.parquet")
+
+# Open dataset
+# all_oac_index <- read_parquet("C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/all_oac_index.parquet")
+
+#Extract unique IDs of OAC users meeting criteria  
+all_drug_index_ids <- unique(all_oac_index$ENROLID) #2057997
+
+```
+
+# Continuous enrollment
+
+```{r}
+
+# ── IDs + index date for CE assessment ────────────────────────────────────────
+cohort_ids_for_CE <- all_oac_index |>
+  arrange(ENROLID, index_date) |>
+  select(ENROLID, index_date) |>
+  distinct() |>
+  mutate(index_date = as.Date(index_date))
+
+cont_enrollment_ids <- unique(cohort_ids_for_CE$ENROLID)
+
+# ── Load enrollment windows (T files) only for relevant IDs ───────────────────
+load_enrollment_data <- function(path, ids) {
+  open_dataset(path) |>
+    select(ENROLID, DTSTART, DTEND) |>
+    filter(ENROLID %in% ids) |>
+    collect() |>
+    mutate(
+      DTSTART = as.Date(DTSTART),
+      DTEND   = as.Date(DTEND)
+    )
+}
+
+ccae_enroll <- load_enrollment_data("//pharm-c-psop/TruvenData/Truven Data R/ccae/t", cont_enrollment_ids)
+mdcr_enroll <- load_enrollment_data("//pharm-c-psop/TruvenData/Truven Data R/mdcr/t", cont_enrollment_ids)
+all_enroll  <- bind_rows(ccae_enroll, mdcr_enroll)
+
+# ── Continuous enrollment filter (183d lookback, 0d after, 30d max gap) ───────
+continuous_enrollment_result <- ContinuousEnrollment(
+  enrollment_data = all_enroll,
+  data            = cohort_ids_for_CE,
+  days_after      = 0,
+  days_before     = 183,
+  max_gap         = 30,
+  index_date_var  = index_date
+)
+
+# ── Vector of IDs with CE ─────────────────────────────────────────────────────
+ids_with_ce <- unique(continuous_enrollment_result$ENROLID)
+message("CE-kept IDs: ", length(ids_with_ce))
+
+
+```
+
+#Chunk to evaluate stop of follow-up (disenrollment)
+
+```{r}
+# Create parquet file of T datasets with relevant IDs
+all_enroll |> write_parquet("C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/enrollment_parquet.parquet") 
+
+# Read parquet file back into the environment
+enrollment_parquet <- read_parquet("C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/enrollment_parquet.parquet") 
+
+max_gap <- 30
+
+# Filter for ids with CE determined above
+disenrollment <- enrollment_parquet |>
+  filter(ENROLID %in% ids_with_ce) |> 
+  select(ENROLID, DTSTART, DTEND) |> 
+  to_duckdb() |>
+  window_order(ENROLID, DTSTART) |>  
+  group_by(ENROLID) |> 
+  mutate(
+    gap_days = as.numeric(DTSTART - lag(DTEND) - 1),      # true gap = start - prev_end - 1
+    gap_days = if_else(is.na(gap_days), max_gap + 1, pmax(gap_days,0)), # treat first row as big gap
+    continuous_cov_start = if_else(gap_days > max_gap, DTSTART, NA),
+    cont_enrol = if_else(is.na(continuous_cov_start), 0, 1),
+    episode = cumsum(cont_enrol)
+  ) |>  
+  ungroup() |> 
+  group_by(ENROLID, episode) |> 
+  summarise(
+    start_cont_enrol = min(DTSTART), 
+    end_cont_enrol   = max(DTEND),
+    .groups = "drop"
+  ) |> 
+  collect()
+
+b <- cohort_ids_for_CE |> 
+  filter(ENROLID %in% ids_with_ce) |> 
+  left_join(disenrollment, by = "ENROLID") |> 
+  arrange(ENROLID, index_date) |>
+  filter(start_cont_enrol <= index_date, end_cont_enrol >= index_date) |> 
+  select(ENROLID, index_date, end_cont_enrol)
+
+all_oac_index_ce <- all_oac_index |> 
+  filter(ENROLID %in% ids_with_ce) |>  
+  left_join(b, by = c("ENROLID", "index_date"))
+
+# Save dataset so you don't have to recompute
+write_parquet(all_oac_index_ce, "C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/all_oac_index_ce.parquet")
+
+# Reopen if needed
+all_oac_index_ce <- read_parquet("C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/all_oac_index_ce.parquet")
+
+
+```
+
+# Apply continuous exposure rules
+
+```{r}
+# ---- Continuous exposure censor (switch or discontinuation) ----
+cont_exposure <- all_oac_index_ce |>
+  arrange(ENROLID, episode_number, SVCDATE) |>
+  group_by(ENROLID, episode_number) |>
+  mutate(
+    exhaustion_date         = SVCDATE + DAYSUPP - 1,            # inclusive days supply
+    grace_days              = round(pmin(DAYSUPP * 0.3, 30)),
+    next_prescription_date  = lead(SVCDATE),
+    next_prescription_drug  = lead(GENNME),
+    adherence_status = case_when(
+      !is.na(next_prescription_date) &
+        next_prescription_date <= exhaustion_date + grace_days &
+        next_prescription_drug == index_med                     ~ "Adherent",
+      !is.na(next_prescription_date) &
+        next_prescription_drug != index_med                     ~ "Switched",
+      TRUE                                                      ~ "Discontinued"
+    ),
+    end_date = case_when(
+      adherence_status == "Adherent"     ~ as.Date(NA),                       # keep going
+      adherence_status == "Switched"     ~ next_prescription_date - 1L,            # stop at switch
+      adherence_status == "Discontinued" ~ exhaustion_date + grace_days       # stop at gap end
+    )
+  ) |>
+  # Summarise to the FIRST time exposure must end in the episode
+  summarise(
+    discontinuation_or_switch_date = {
+      x <- end_date[!is.na(end_date)]
+      if (length(x) == 0L) as.Date(NA) else min(x)
+    },
+    .groups = "drop"
+  )
+
+# ---- Merge back; cap follow-up by enrollment and study end ----
+study_end <- as.Date("2021-12-31")
+
+all_oac_index_ce_cont_exp <- all_oac_index_ce |>
+  left_join(cont_exposure, by = c("ENROLID", "episode_number")) |>
+  group_by(ENROLID, episode_number) |>
+  mutate(
+    obj_period_end = pmin(
+      coalesce(end_cont_enrol, study_end),
+      coalesce(discontinuation_or_switch_date, study_end),
+      study_end,
+      na.rm = TRUE
+    ), 
+    follow_up_days = as.integer(obj_period_end - index_date + 1L)
+  ) |>
+  ungroup() |>
+  filter(follow_up_days > 0)
+
+oac_cohort <- all_oac_index_ce_cont_exp |>
+  distinct(ENROLID, episode_number, index_med, index_date, age_at_index, obj_period_end, follow_up_days)
+
+# Persist & reload if desired
+write_parquet(oac_cohort, "C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/oac_cohort.parquet")
+oac_cohort <- read_parquet("C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/oac_cohort.parquet")
+
+# IDs to use downstream
+oac_user_ids <- unique(oac_cohort$ENROLID)
+
+```
+
+# Outcome Identification
+
+\# 3. IDENTIFY BLEED EVENTS WITH FULL NUANCED RULES \# Rule 2: For definite bleed codes, PDX (principal diagnosis) must contain one of the definite codes. \# Rule 3: For "possible" bleed codes, PDX must contain a possible code and either: \# (a) at least one secondary diagnosis (DX2:DX15) contains a definite bleed code, OR \# (b) a transfusion revenue code is present. \# Rule 4: For unspecified bleed codes, PDX must be in the unspec group and require secondary definite bleed code (transfusion is NOT sufficient). \# Rule 5: For GU bleed codes, if PDX matches a GU possible code (e.g., 6262), then require that at least one secondary diagnosis contains a code from all_comb_sec.
+
+```{r}
+
+identify_bleed_outcome <- function(dataset_path_s, dataset_path_i, dataset_path_o, output_path_event) {
+  
+  
+  # --- Collapse Bleed Code Vectors into Regex Strings ---
+  gib_icd9_ind_pattern      <- paste(gib_icd9_ind, collapse = "|")
+  gu_icd9_ind_pattern       <- paste(gu_icd9_ind, collapse = "|")
+  cerebral_icd9_ind_pattern <- paste(cerebral_icd9_ind, collapse = "|")
+  other_icd9_ind_pattern    <- paste(other_icd9_ind, collapse = "|")
+  all_icd9_bleeds_ind_pattern <- paste(all_icd9_bleeds_ind, collapse = "|")
+  
+  gib_icd10_ind_pattern      <- paste(gib_icd10_ind, collapse = "|")
+  gu_icd10_ind_pattern       <- paste(gu_icd10_ind, collapse = "|")
+  cerebral_icd10_ind_pattern <- paste(cerebral_icd10_ind, collapse = "|")
+  other_icd10_ind_pattern    <- paste(other_icd10_ind, collapse = "|")
+  all_icd10_bleeds_ind_pattern <- paste(all_icd10_bleeds_ind, collapse = "|")
+  
+  all_gib_icd9_possible_pattern  <- paste(all_gib_icd9_possible, collapse = "|")
+  all_unspec_icd9_possible_pattern <- paste(all_unspec_icd9_possible, collapse = "|")
+  gu_icd9_possible_pattern         <- gu_icd9_possible  # Already a string
+  
+  all_gib_icd10_possible_pattern  <- paste(all_gib_icd10_possible, collapse = "|")
+  all_unspec_icd10_possible_pattern <- paste(all_unspec_icd10_possible, collapse = "|")
+  
+  all_comb_sec_pattern_icd9  <- paste(all_comb_sec_icd9, collapse = "|")
+  all_comb_sec_pattern_icd10 <- paste(all_comb_sec_icd10, collapse = "|")
+  
+  # (Assume trauma_hcpcs_all and trauma_check_icd9/trauma_check_icd10, etc. are defined externally)
+  
+  # =========================================================================
+  # 1. LOAD TRANSFUSION DATA 
+  transfusion_data <- open_dataset(dataset_path_s) %>%
+    select(ENROLID, YEAR, ADMDATE, DISDATE, REVCODE) %>%
+    filter(ENROLID %in% oac_user_ids) %>%
+    collect() %>%
+    mutate(REVCODE3 = substr(REVCODE, 1, 3)) %>%
+    filter(REVCODE3 %in% c("038","039")) %>%
+    transmute(ENROLID, YEAR, ADMDATE = as.Date(ADMDATE), DISDATE = as.Date(DISDATE),
+              transfusion_code = 1L) %>%
+    distinct()
+  
+  # =========================================================================
+  # 2. LOAD INPATIENT DATA & MERGE TRANSFUSION INFO
+  inpatient_data <- open_dataset(dataset_path_i, unify_schemas = TRUE) %>%
+    select(ENROLID, YEAR, ADMDATE, AGE, DAYS, DISDATE, DXVER, PDX, DX1:DX15, PROC1:PROC15) %>%
+    filter(ENROLID %in% oac_user_ids) %>%
+    collect() %>%
+    left_join(transfusion_data, by = c("ENROLID", "YEAR", "ADMDATE", "DISDATE")) %>%
+    mutate(PDX = coalesce(PDX, DX1)) |> 
+    mutate(
+      DXVER = case_when(
+        DXVER %in% c("0","9") ~ as.numeric(DXVER),
+        is.na(DXVER) & ADMDATE >= as.Date("2015-10-01") ~ 0,
+        is.na(DXVER) & ADMDATE <  as.Date("2015-10-01") ~ 9,
+        TRUE ~ suppressWarnings(as.numeric(DXVER))
+    )) |> 
+    filter(!is.na(DXVER)) |> 
+    # Unite secondary diagnosis columns for vectorized matching.
+    mutate(across(c(PDX, DX1:DX15, PROC1:PROC15), as.character))
+  
+  # =========================================================================
+  # 3. IDENTIFY BLEED EVENTS WITH NUANCED RULES
+  sec_dx_cols <- paste0("DX", 2:15)
+  proc_cols <- paste0("PROC", 1:15)
+  
+  inpatient_bleed <- inpatient_data %>%
+    mutate(
+      definite_bleed = case_when(
+        DXVER == 9 ~ str_detect(PDX, all_icd9_bleeds_ind_pattern),
+        DXVER == 0 ~ str_detect(PDX, all_icd10_bleeds_ind_pattern),
+        TRUE ~ FALSE
+      ),
+      possible_bleed = case_when(
+        DXVER == 9 ~ ( str_detect(PDX, all_gib_icd9_possible_pattern) | 
+                        str_detect(PDX, all_unspec_icd9_possible_pattern) | 
+                        str_detect(PDX, gu_icd9_possible_pattern) ),
+        DXVER == 0 ~ ( str_detect(PDX, all_gib_icd10_possible_pattern) | 
+                        str_detect(PDX, all_unspec_icd10_possible_pattern) ),
+        TRUE ~ FALSE
+      ),
+      
+      has_sec_bleed_icd9   = if_any(all_of(sec_dx_cols), ~ str_detect(.x, all_icd9_bleeds_ind_pattern)),
+      has_sec_bleed_icd10  = if_any(all_of(sec_dx_cols), ~ str_detect(.x, all_icd10_bleeds_ind_pattern)),
+      has_icd9_comb        = if_any(all_of(sec_dx_cols), ~ str_detect(.x, all_comb_sec_pattern_icd9)),
+      has_icd10_comb       = if_any(all_of(sec_dx_cols), ~ str_detect(.x, all_comb_sec_pattern_icd10)),
+      
+      confirmatory = case_when(
+        DXVER == 9 & str_detect(PDX, all_unspec_icd9_possible_pattern) ~ has_sec_bleed_icd9,
+        DXVER == 0 & str_detect(PDX, all_unspec_icd10_possible_pattern) ~ has_sec_bleed_icd10,
+        DXVER == 9 & str_detect(PDX, gu_icd9_possible_pattern) ~ has_icd9_comb,
+        DXVER == 9 ~ (has_sec_bleed_icd9  | !is.na(transfusion_code)),
+        DXVER == 0 ~ (has_sec_bleed_icd10 | !is.na(transfusion_code)),
+        TRUE ~ FALSE
+        ),
+      
+      bleed_code = (definite_bleed | (possible_bleed & confirmatory)),
+      
+      bleed_GI    = if_else(DXVER == 9, str_detect(PDX, gib_icd9_ind_pattern),
+                             if_else(DXVER == 0, str_detect(PDX, gib_icd10_ind_pattern), FALSE)),
+      bleed_GU    = if_else(DXVER == 9, str_detect(PDX, gu_icd9_ind_pattern),
+                             if_else(DXVER == 0, str_detect(PDX, gu_icd10_ind_pattern), FALSE)),
+      bleed_CNS   = if_else(DXVER == 9, str_detect(PDX, cerebral_icd9_ind_pattern),
+                             if_else(DXVER == 0, str_detect(PDX, cerebral_icd10_ind_pattern), FALSE)),
+      bleed_Other = if_else(DXVER == 9, str_detect(PDX, other_icd9_ind_pattern),
+                             if_else(DXVER == 0, str_detect(PDX, other_icd10_ind_pattern), FALSE))
+    ) %>%
+    mutate(
+      bleed_site = case_when(
+        bleed_GI ~ "GI",
+        bleed_GU ~ "GU",
+        bleed_CNS ~ "CNS",
+        bleed_Other ~ "Other",
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    filter(bleed_code)
+  
+  # =========================================================================
+  # 4. IDENTIFY TRAUMA EVENTS WITH SITE ASSIGNMENT (INPATIENT)
+  
+ inpatient_trauma <- inpatient_bleed %>%
+  mutate(
+    # any trauma dx (principal or secondary) or trauma HCPCS in any PROC field
+    has_trauma_icd9  = if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd9)),
+    has_trauma_icd10 = if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd10)),
+    has_trauma_hcpcs = if_any(all_of(proc_cols),            ~ str_detect(.x, trauma_hcpcs_all)),
+
+    trauma_code = case_when(
+      DXVER == 9 ~ (has_trauma_icd9  | has_trauma_hcpcs),
+      DXVER == 0 ~ (has_trauma_icd10 | has_trauma_hcpcs),
+      TRUE ~ FALSE
+    ),
+
+    # site assignment using the same per-field logic
+    trauma_site = case_when(
+      DXVER == 9 & if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd9_GI))    ~ "GI",
+      DXVER == 9 & if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd9_GU))    ~ "GU",
+      DXVER == 9 & if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd9_CNS))   ~ "CNS",
+      DXVER == 9 & if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd9_Other)) ~ "Other",
+      DXVER == 0 & if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd10_GI))   ~ "GI",
+      DXVER == 0 & if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd10_GU))   ~ "GU",
+      DXVER == 0 & if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd10_CNS))  ~ "CNS",
+      DXVER == 0 & if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd10_Other))~ "Other",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  transmute(ENROLID,
+              ADMDATE = as.Date(ADMDATE),
+              trauma_code, trauma_site) %>%
+    filter(trauma_code, !is.na(trauma_site)) %>%
+    mutate(trauma_date = ADMDATE) %>%
+    select(ENROLID, trauma_date, trauma_site)
+  
+  
+  # =========================================================================
+  # 5. IDENTIFY TRAUMA EVENTS WITH SITE ASSIGNMENT (OUTPATIENT)
+  bleed_ids <- unique(inpatient_bleed$ENROLID)
+  
+  outpatient_data <- open_dataset(dataset_path_o, unify_schemas = TRUE) %>%
+    select(ENROLID, SVCDATE, DXVER, DX1, DX2, DX3, DX4, PROC1) %>%
+    filter(ENROLID %in% bleed_ids) %>%
+    collect() %>%
+    mutate(
+    DXVER = case_when(
+      DXVER %in% c("0","9") ~ as.numeric(DXVER),
+      is.na(DXVER) & SVCDATE >= as.Date("2015-10-01") ~ 0,
+      is.na(DXVER) & SVCDATE <  as.Date("2015-10-01") ~ 9,
+      TRUE ~ suppressWarnings(as.numeric(DXVER))
+    )
+  ) %>%
+  filter(!is.na(DXVER)) %>%
+  mutate(across(c(DX1, DX2, DX3, DX4, PROC1), as.character))
+
+out_dx_cols <- paste0("DX", 1:4)
+
+outpatient_trauma <- outpatient_data %>%
+  mutate(
+    has_trauma_icd9  = if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd9)),
+    has_trauma_icd10 = if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd10)),
+    has_trauma_hcpcs = str_detect(PROC1, trauma_hcpcs_all),
+
+    trauma_code = case_when(
+      DXVER == 9 ~ (has_trauma_icd9  | has_trauma_hcpcs),
+      DXVER == 0 ~ (has_trauma_icd10 | has_trauma_hcpcs),
+      TRUE ~ FALSE
+    ),
+
+    trauma_site = case_when(
+      DXVER == 9 & if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd9_GI))    ~ "GI",
+      DXVER == 9 & if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd9_GU))    ~ "GU",
+      DXVER == 9 & if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd9_CNS))   ~ "CNS",
+      DXVER == 9 & if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd9_Other)) ~ "Other",
+      DXVER == 0 & if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd10_GI))   ~ "GI",
+      DXVER == 0 & if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd10_GU))   ~ "GU",
+      DXVER == 0 & if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd10_CNS))  ~ "CNS",
+      DXVER == 0 & if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd10_Other))~ "Other",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  transmute(ENROLID,
+              trauma_date = as.Date(SVCDATE),
+              trauma_code, trauma_site) %>%
+    filter(trauma_code, !is.na(trauma_site))
+  
+  # =========================================================================
+  # 6. COMBINE ALL TRAUMA EVENTS
+  all_trauma_codes <- bind_rows(inpatient_trauma, outpatient_trauma) %>%
+    distinct() %>%
+    arrange(ENROLID, trauma_date)
+  
+  # =========================================================================
+  # 7. MERGE TRAUMA WITH BLEED EVENTS FOR EXCLUSION
+  # Exclude a bleed if a trauma event with matching site occurs within ADMDATE-1 to ADMDATE+1.
+  inpatient_bleed_trauma_merged <- inpatient_bleed %>%
+    mutate(ADMDATE = as.Date(ADMDATE)) %>%
+  left_join(all_trauma_codes, by = "ENROLID") %>%
+  mutate(
+    within_window = between(trauma_date, ADMDATE - 1, ADMDATE + 1),
+    trauma_match  = (!is.na(bleed_site) & bleed_site == trauma_site)
+  ) %>%
+  filter(within_window, trauma_match) %>%
+  distinct(ENROLID, ADMDATE) %>%
+  mutate(exclusion_event = 1L)
+  
+  # =========================================================================
+  # 8. EXCLUDE TRAUMA-RELATED BLEED EVENTS AND SAVE FINAL OUTCOME
+  bleed_outcome_no_trauma <- inpatient_bleed %>%
+    left_join(inpatient_bleed_trauma_merged, by = c("ENROLID", "ADMDATE")) %>%
+    filter(bleed_code) %>%
+    filter(is.na(exclusion_event)) |> 
+  select(ENROLID, ADMDATE, DISDATE, DAYS, DXVER, PDX, starts_with("DX"), starts_with("PROC"),
+           bleed_site)
+  
+  # Persist
+  write_parquet(bleed_outcome_no_trauma, output_path_event)
+  invisible(bleed_outcome_no_trauma)
+}
+
+# =============================================================================
+# Example calls for CCAE and MDCR datasets:
+ccae_bleed_outcome_no_trauma <- identify_bleed_outcome(
+  dataset_path_s = "//pharm-c-psop/TruvenData/Truven Data R/ccae/s",
+  dataset_path_i = "//pharm-c-psop/TruvenData/Truven Data R/ccae/i",
+  dataset_path_o = "//pharm-c-psop/TruvenData/Truven Data R/ccae/o",
+  output_path_event = "C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/ccae_bleed_outcome_no_trauma.parquet"
+)
+
+mdcr_bleed_outcome_no_trauma <- identify_bleed_outcome(
+  dataset_path_s = "//pharm-c-psop/TruvenData/Truven Data R/mdcr/s",
+  dataset_path_i = "//pharm-c-psop/TruvenData/Truven Data R/mdcr/i",
+  dataset_path_o = "//pharm-c-psop/TruvenData/Truven Data R/mdcr/o",
+  output_path_event = "C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/mdcr_bleed_outcome_no_trauma.parquet"
+)
+
+# =============================================================================
+# Merge outcome files and create final outcome vector:
+
+
+all_outcome <- bind_rows(ccae_bleed_outcome_no_trauma, mdcr_bleed_outcome_no_trauma) %>%
+  arrange(ENROLID, ADMDATE) %>%
+  group_by(ENROLID) %>%
+  mutate(hospnum = row_number()) %>%
+  ungroup() %>%
+  mutate(eventnum = row_number()) %>%
+  select(ENROLID, ADMDATE, DAYS, DISDATE, hospnum, eventnum, bleed_site)
+
+all_outcome |> write_parquet("C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/all_inpatient_bleed_no_trauma.parquet")
+
+# Read in datasets if needed
+# ccae_bleed_outcome_no_trauma <- read_parquet("C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/ccae_bleed_outcome_no_trauma.parquet")
+# mdcr_bleed_outcome_no_trauma <- read_parquet("C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/mdcr_bleed_outcome_no_trauma.parquet")
+
+all_inpatient_bleed_no_trauma <- read_parquet("C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/all_inpatient_bleed_no_trauma.parquet")
+
+outcome_vec <- unique(all_inpatient_bleed_no_trauma$ENROLID)
+
+
+# ============================================================
+# Collapse transfers into one clinical event (≤1-day gap)
+#   — If you want stricter/looser: change threshold from 1 to 0/3/7
+# ============================================================
+collapse_transfers <- function(all_outcome, max_gap_days = 1) {
+  # minimal columns needed
+  base <- all_outcome %>%
+    transmute(
+      ENROLID,
+      admdt = as.Date(ADMDATE),
+      disdt = as.Date(DISDATE),
+      bleed_site
+    ) %>%
+    distinct() %>%
+    arrange(ENROLID, admdt, disdt)
+
+  # identify transfer chains within patient
+  chained <- base %>%
+    group_by(ENROLID) %>%
+    mutate(
+      gap_from_prev = as.integer(admdt - lag(disdt)),
+      new_episode   = if_else(is.na(gap_from_prev) | gap_from_prev > max_gap_days, 1L, 0L),
+      bleed_ep_id   = cumsum(new_episode)
+    ) %>%
+    ungroup()
+
+  # map of original rows to collapsed episode (for auditing)
+  collapse_map <- chained %>%
+    group_by(ENROLID, bleed_ep_id) %>%
+    arrange(admdt, disdt, .by_group = TRUE) %>%
+    mutate(row_in_chain = row_number()) %>%
+    ungroup() %>%
+    mutate(collapsed = row_in_chain > 1L) %>%
+    select(ENROLID, admdt, disdt, bleed_site, bleed_ep_id, row_in_chain, collapsed)
+
+  # collapsed events (one row per chain)
+  events_collapsed <- collapse_map %>%
+    group_by(ENROLID, bleed_ep_id) %>%
+    reframe(
+      bleed_adm_date = min(admdt, na.rm = TRUE),
+      bleed_dis_date = max(disdt, na.rm = TRUE),
+      # keep the first non-missing site across a transfer chain
+      bleed_site     = {
+        s <- bleed_site[!is.na(bleed_site)]
+        if (length(s)) s[1] else NA_character_
+      }
+    )
+
+  list(events_collapsed = events_collapsed, collapse_map = collapse_map)
+}
+
+# ---- usage ----
+x <- collapse_transfers(all_outcome, max_gap_days = 1)
+events_collapsed <- x$events_collapsed
+collapse_map     <- x$collapse_map
+
+
+# Create a vector of unique ENROLIDs with an outcome:
+outcome_vec <- unique(events_collapsed$ENROLID)
+
+
+```
+
+# Create analytic cohort
+
+```{r}
+analytic_cohort_oac <- oac_cohort %>%
+  select(ENROLID, episode_number, index_med, index_date, age_at_index, obj_period_end) %>%
+  inner_join(events_collapsed, by = "ENROLID") %>%
+  group_by(ENROLID) |> # not grouping by episode number so that prior events for same patient who indexes twice (or more) are captured
+  mutate(pre_index_event = as.integer(any(bleed_adm_date < index_date))) |> 
+  ungroup() |> 
+  filter(bleed_adm_date >= index_date,
+         bleed_adm_date <= obj_period_end) %>%
+  arrange(ENROLID, episode_number, bleed_adm_date) %>%
+  group_by(ENROLID, episode_number) %>%
+  mutate(
+    episode_event_seq = row_number(),
+    days_from_index   = as.integer(bleed_adm_date - index_date)
+  ) %>%
+  ungroup() |> 
+  arrange(ENROLID, index_date, bleed_adm_date) |> 
+  mutate(
+    day_obs_start = 0L, 
+    day_obs_end = as.integer(obj_period_end - index_date), 
+    day_of_event = as.integer(bleed_adm_date - index_date), 
+    object = index_med
+  ) 
+
+analytic_cohort_oac <- analytic_cohort_oac |>
+  mutate(object = canon_oac(object))
+
+# analytic_cohort_oac_2 <- analytic_cohort_oac |> 
+#   # group_by(ENROLID) |> 
+#   # filter(episode_number == min(episode_number)) |>  #only allows for minimum episode number for each person (no re-entry)
+#   # ungroup() |> 
+#   mutate(age_group_index = case_when(
+#     age_at_index >= 18 & age_at_index <= 44 ~ "18-44",
+#     age_at_index >= 45 & age_at_index <= 64 ~ "45-64",
+#     age_at_index >= 65 & age_at_index <= 74 ~ "65-74",
+#     age_at_index >= 75 & age_at_index <= 84 ~ "75-84",
+#     age_at_index >= 85 & age_at_index <= 90 ~ "85-90",
+#     age_at_index > 90 ~ ">90",
+#     TRUE ~ "Other"
+#   ))
+
+cohort_ids <- unique(analytic_cohort_oac$ENROLID)
+
+write_rds(analytic_cohort_oac, "C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/analytic_cohort_oac.rds")
+
+analytic_cohort_oac <- read_rds("C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/analytic_cohort_oac.rds")
+
+```
+
+#Build Table 1 -skipped
+
+```{r}
+# =========================
+# Table 1 generation (revised)
+# =========================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(arrow)
+  library(readxl)
+  library(gt)
+})
+
+# -------------------------
+# Helpers
+# -------------------------
+normalize_codes <- function(x) {
+  x <- as.character(x)
+  x <- gsub("\\.", "", x)
+  toupper(trimws(x))
+}
+
+# Extended flag function (exact matching after normalization)
+flag_condition_extended <- function(data, condition_name, 
+                                    icd9_vector, icd10_vector, 
+                                    proc_vector = NULL,
+                                    diag_cols,  
+                                    proc_cols) {
+  new_col <- paste0(condition_name, "_flag")
+  icd9_vector  <- normalize_codes(icd9_vector)
+  icd10_vector <- normalize_codes(icd10_vector)
+  if (!is.null(proc_vector)) proc_vector <- normalize_codes(proc_vector)
+
+  data %>%
+    mutate(
+      !!new_col := {
+        diag_flag <- case_when(
+          DXVER == 9 ~ rowSums(across(all_of(diag_cols), ~ normalize_codes(.) %in% icd9_vector),  na.rm = TRUE) > 0,
+          DXVER == 0 ~ rowSums(across(all_of(diag_cols), ~ normalize_codes(.) %in% icd10_vector), na.rm = TRUE) > 0,
+          TRUE ~ FALSE
+        )
+        if (!is.null(proc_vector) && length(proc_cols) > 0) {
+          proc_flag <- rowSums(across(all_of(proc_cols), ~ normalize_codes(.) %in% proc_vector), na.rm = TRUE) > 0
+          as.integer(diag_flag | proc_flag)
+        } else {
+          as.integer(diag_flag)
+        }
+      }
+    )
+}
+
+# Load claims, filter by lookback, flag HAS-BLED, summarise per ENROLID/index_date
+flag_hasbled_dataset <- function(dataset_path, diag_cols, proc_cols,
+                                 cohort_ids, cohort_ids_index,
+                                 lookback = 183,
+                                 date_col = "ADMDATE") {
+  date_sym <- rlang::sym(date_col)
+
+  claims <- open_dataset(dataset_path, unify_schemas = TRUE) %>%
+    select(ENROLID, YEAR, !!date_sym, DXVER, all_of(diag_cols), all_of(proc_cols)) %>%
+    filter(ENROLID %in% cohort_ids) %>%
+    collect() %>%
+    mutate(
+      across(all_of(diag_cols), ~ as.character(.x)),
+      across(all_of(proc_cols), ~ as.character(.x)),
+      !!date_sym := as.Date(!!date_sym),
+      DXVER = case_when(
+        DXVER %in% c("0","9") ~ as.numeric(DXVER),
+        is.na(DXVER) & (!!date_sym) >= as.Date("2015-10-01") ~ 0,
+        is.na(DXVER) & (!!date_sym) <  as.Date("2015-10-01") ~ 9,
+        TRUE ~ suppressWarnings(as.numeric(DXVER))
+      )
+    ) %>%
+    filter(!is.na(DXVER)) %>%
+    mutate(
+      across(all_of(diag_cols), normalize_codes),
+      across(all_of(proc_cols),  normalize_codes)
+    )
+
+  claims_indexed <- cohort_ids_index %>%
+    mutate(index_date = as.Date(index_date)) %>%
+    left_join(claims, by = "ENROLID") %>%
+    filter((!!date_sym) >= index_date - lookback,
+           (!!date_sym) <  index_date)   # exclude index day
+
+  claims_flagged <- claims_indexed %>%
+    flag_condition_extended("htn",    hasbled_htn_icd9,   hasbled_htn_icd10,   diag_cols = diag_cols, proc_cols = proc_cols) %>%
+    flag_condition_extended("liver",  hasbled_liver_icd9, hasbled_liver_icd10, diag_cols = diag_cols, proc_cols = proc_cols) %>%
+    flag_condition_extended("kidney", hasbled_kidney_icd9,hasbled_kidney_icd10,diag_cols = diag_cols, proc_cols = proc_cols) %>%
+    flag_condition_extended("stroke", hasbled_stroke_icd9,hasbled_stroke_icd10,diag_cols = diag_cols, proc_cols = proc_cols) %>%
+    flag_condition_extended("bleed",  hasbled_bleed_icd9, hasbled_bleed_icd10, diag_cols = diag_cols, proc_cols = proc_cols) %>%
+    flag_condition_extended("alc",    hasbled_alc_icd9,   hasbled_alc_icd10,   proc_vector = hasbled_alc_proc,
+                            diag_cols = diag_cols, proc_cols = proc_cols)
+
+  claims_flagged %>%
+    group_by(ENROLID, index_date) %>%
+    summarise(
+      hasbled_htn    = as.integer(sum(htn_flag,    na.rm = TRUE) > 0),
+      hasbled_liver  = as.integer(sum(liver_flag,  na.rm = TRUE) > 0),
+      hasbled_kidney = as.integer(sum(kidney_flag, na.rm = TRUE) > 0),
+      hasbled_stroke = as.integer(sum(stroke_flag, na.rm = TRUE) > 0),
+      hasbled_bleed  = as.integer(sum(bleed_flag,  na.rm = TRUE) > 0),
+      hasbled_alc    = as.integer(sum(alc_flag,    na.rm = TRUE) > 0),
+      .groups = "drop"
+    )
+}
+
+# -------------------------
+# 1) HAS-BLED flags from claims (inpatient + outpatient)
+# -------------------------
+dataset_path_i_ccae <- "//pharm-c-psop/TruvenData/Truven Data R/ccae/i"
+inpt_summary_ccae <- flag_hasbled_dataset(
+  dataset_path_i_ccae,
+  diag_cols = c("PDX", paste0("DX", 1:15)),
+  proc_cols = paste0("PROC", 1:15),
+  cohort_ids = cohort_ids,
+  cohort_ids_index = cohort_ids_index,
+  date_col = "ADMDATE"
+)
+
+dataset_path_i_mdcr <- "//pharm-c-psop/TruvenData/Truven Data R/mdcr/i"
+inpt_summary_mdcr <- flag_hasbled_dataset(
+  dataset_path_i_mdcr,
+  diag_cols = c("PDX", paste0("DX", 1:15)),
+  proc_cols = paste0("PROC", 1:15),
+  cohort_ids = cohort_ids,
+  cohort_ids_index = cohort_ids_index,
+  date_col = "ADMDATE"
+)
+
+dataset_path_o_ccae <- "//pharm-c-psop/TruvenData/Truven Data R/ccae/o"
+outpt_summary_ccae <- flag_hasbled_dataset(
+  dataset_path_o_ccae,
+  diag_cols = paste0("DX", 1:4),
+  proc_cols = "PROC1",
+  cohort_ids = cohort_ids,
+  cohort_ids_index = cohort_ids_index,
+  date_col = "SVCDATE"
+)
+
+dataset_path_o_mdcr <- "//pharm-c-psop/TruvenData/Truven Data R/mdcr/o"
+outpt_summary_mdcr <- flag_hasbled_dataset(
+  dataset_path_o_mdcr,
+  diag_cols = paste0("DX", 1:4),
+  proc_cols = "PROC1",
+  cohort_ids = cohort_ids,
+  cohort_ids_index = cohort_ids_index,
+  date_col = "SVCDATE"
+)
+
+combined_summary <- bind_rows(
+  inpt_summary_ccae, inpt_summary_mdcr,
+  outpt_summary_ccae, outpt_summary_mdcr
+) %>%
+  group_by(ENROLID, index_date) %>%
+  summarise(
+    hasbled_htn    = as.integer(sum(hasbled_htn,    na.rm = TRUE) > 0),
+    hasbled_liver  = as.integer(sum(hasbled_liver,  na.rm = TRUE) > 0),
+    hasbled_kidney = as.integer(sum(hasbled_kidney, na.rm = TRUE) > 0),
+    hasbled_stroke = as.integer(sum(hasbled_stroke, na.rm = TRUE) > 0),
+    hasbled_bleed  = as.integer(sum(hasbled_bleed,  na.rm = TRUE) > 0),
+    hasbled_alc    = as.integer(sum(hasbled_alc,    na.rm = TRUE) > 0),
+    .groups = "drop"
+  )
+
+# -------------------------
+# 2) Drug proxies for HAS-BLED D and A components
+# -------------------------
+hasbled_drugs <- read_excel(
+  "C:/Users/kahanso2/Documents/doac-ddi/codes/doac_ddi_codebook.xlsx",
+  sheet = "hasbled_drugs"
+)
+hasbled_bleed_drug <- hasbled_drugs$other_anticoag_hasbled
+hasbled_alc_drug   <- hasbled_drugs$alcohol_abuse_hasbled
+
+# safer regex escaper + finder
+esc <- function(x) {
+  x <- unique(na.omit(trimws(as.character(x))))
+  stringr::str_replace_all(x, "([\\^$.|?*+()\\[\\]{}])", "\\\\\\1")
+}
+get_ndc_by_drug_name_hasbled <- function(drug_list) {
+  terms <- esc(drug_list)
+  if (length(terms) == 0) return(character(0))
+  pat <- paste0("(?i)\\b(?:", paste(terms, collapse = "|"), ")\\b")
+  redbook %>%
+    mutate(GENNME = as.character(GENNME)) %>%
+    filter(stringr::str_detect(GENNME, stringr::regex(pat))) %>%
+    distinct(NDCNUM) %>%
+    pull()
+}
+hasbled_bleed_drug_ndc <- get_ndc_by_drug_name_hasbled(hasbled_bleed_drug)
+hasbled_alc_drug_ndc   <- get_ndc_by_drug_name_hasbled(hasbled_alc_drug)
+
+extract_hasbled_drug_data <- function(dataset_path, output_path, ndc_filter) {
+  drug_data <- open_dataset(dataset_path) %>%
+    select(ENROLID, NDCNUM, SVCDATE, YEAR, AGE, DAYSUPP) %>%
+    filter(ENROLID %in% cohort_ids) %>%
+    filter(NDCNUM %in% ndc_filter) %>%
+    collect()
+
+  drug_data_names <- drug_data %>%
+    left_join(redbook, by = "NDCNUM") %>%
+    select(ENROLID, NDCNUM, SVCDATE, YEAR, AGE, DAYSUPP, THRDTDS, THERCLS, GENNME, MASTFRM, ROADS)
+
+  write_parquet(drug_data_names, output_path)
+  drug_data_names
+}
+
+ccaed_drug_bleed <- extract_hasbled_drug_data(
+  dataset_path = "//pharm-c-psop/TruvenData/Truven Data R/ccae/d",
+  output_path  = "C:/Users/kahanso2/Documents/doac-ddi/data/ccaed_drug_bleed.parquet",
+  ndc_filter   = hasbled_bleed_drug_ndc
+)
+ccaed_drug_alc <- extract_hasbled_drug_data(
+  dataset_path = "//pharm-c-psop/TruvenData/Truven Data R/ccae/d",
+  output_path  = "C:/Users/kahanso2/Documents/doac-ddi/data/ccaed_drug_alc.parquet",
+  ndc_filter   = hasbled_alc_drug_ndc
+)
+mdcrd_drug_bleed <- extract_hasbled_drug_data(
+  dataset_path = "//pharm-c-psop/TruvenData/Truven Data R/mdcr/d",
+  output_path  = "C:/Users/kahanso2/Documents/doac-ddi/data/mdcrd_drug_bleed.parquet",
+  ndc_filter   = hasbled_bleed_drug_ndc
+)
+mdcrd_drug_alc <- extract_hasbled_drug_data(
+  dataset_path = "//pharm-c-psop/TruvenData/Truven Data R/mdcr/d",
+  output_path  = "C:/Users/kahanso2/Documents/doac-ddi/data/mdcrd_drug_alc.parquet",
+  ndc_filter   = hasbled_alc_drug_ndc
+)
+
+drug_all <- bind_rows(ccaed_drug_bleed, ccaed_drug_alc, mdcrd_drug_bleed, mdcrd_drug_alc)
+
+drug_flags <- cohort_ids_index %>%
+  mutate(index_date = as.Date(index_date)) %>%
+  left_join(drug_all, by = "ENROLID") %>%
+  filter(SVCDATE >= index_date - 183, SVCDATE < index_date) %>%  # exclude index day
+  group_by(ENROLID, index_date, age_at_index) %>%
+  summarise(
+    hasbled_bleed_drug = as.integer(n_distinct(NDCNUM[NDCNUM %in% hasbled_bleed_drug_ndc]) > 0),
+    hasbled_alc_drug   = as.integer(n_distinct(NDCNUM[NDCNUM %in% hasbled_alc_drug_ndc])   > 0),
+    .groups = "drop"
+  )
+
+# -------------------------
+# 3) Merge diagnoses + drug proxies → final HAS-BLED features
+# -------------------------
+final_hasbled <- combined_summary %>%
+  full_join(drug_flags, by = c("ENROLID", "index_date")) %>%
+  mutate(across(starts_with("hasbled_"), ~ replace_na(.x, 0))) %>%
+  mutate(
+    elderly = if_else(coalesce(age_at_index, 0) > 65, 1, 0),
+    alcohol = if_else(hasbled_alc == 1 | hasbled_alc_drug == 1, 1, 0),
+    drugs   = if_else(hasbled_bleed_drug == 1, 1, 0),
+    hasbled_score = hasbled_htn + hasbled_liver + hasbled_kidney +
+      hasbled_stroke + hasbled_bleed + elderly + drugs + alcohol
+  ) %>%
+  select(-age_at_index)
+
+# -------------------------
+# 4) Demographics + person-days
+# -------------------------
+demographics_data_ccae <- open_dataset("//pharm-c-psop/TruvenData/Truven Data R/ccae/t") %>%
+  select(ENROLID, PLANTYP, REGION, SEX, DTSTART, DTEND) %>%
+  filter(ENROLID %in% cohort_ids) %>%
+  collect()
+
+demographics_data_mdcr <- open_dataset("//pharm-c-psop/TruvenData/Truven Data R/mdcr/t") %>%
+  select(ENROLID, PLANTYP, REGION, SEX, DTSTART, DTEND) %>%
+  filter(ENROLID %in% cohort_ids) %>%
+  collect()
+
+demo_data_all <- bind_rows(demographics_data_ccae, demographics_data_mdcr) %>% distinct()
+
+cohort_ids_index_demo <- cohort_ids_index %>%
+  left_join(demo_data_all, by = "ENROLID") %>%
+  filter(DTSTART <= index_date) %>%
+  group_by(ENROLID, index_date) %>%
+  slice_max(DTSTART, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(-c(DTSTART, DTEND, age_at_index))
+
+person_days_data <- analytic_cohort_oac_2 %>%
+  select(ENROLID, index_date, day_obs_start, day_obs_end) %>%
+  distinct() %>%
+  group_by(ENROLID, index_date) %>%
+  summarise(total_person_days = sum(day_obs_end - day_obs_start, na.rm = TRUE), .groups = 'drop')
+
+# -------------------------
+# 5) Assemble final table dataset
+# -------------------------
+final_table_data <- analytic_cohort_oac_2 %>%
+  left_join(cohort_ids_index_demo, by = c("ENROLID", "index_date")) %>%
+  left_join(final_hasbled,        by = c("ENROLID", "index_date")) %>%
+  left_join(person_days_data,     by = c("ENROLID", "index_date")) %>%
+  mutate(object = recode(object,
+                         "Warfarin Sodium" = "Warfarin",
+                         "Dabigatran Etexilate Mesylate" = "Dabigatran"))
+
+# Quick wide summaries
+table1 <- final_table_data %>%
+  group_by(object) %>%
+  summarise(
+    cases    = n_distinct(ENROLID),
+    obs_days = sum(total_person_days, na.rm = TRUE),
+    events   = n(),
+    female_n  = sum(as.character(SEX) == "2", na.rm = TRUE),  # 2 = Female
+    female_pct= 100 * female_n / n_distinct(ENROLID),
+    mean_age  = mean(age_at_index, na.rm = TRUE),
+    sd_age    = sd(age_at_index,   na.rm = TRUE),
+    age_18_44 = sum(age_group_index == "18-44", na.rm = TRUE),
+    age_45_64 = sum(age_group_index == "45-64", na.rm = TRUE),
+    age_65_74 = sum(age_group_index == "65-74", na.rm = TRUE),
+    age_75_84 = sum(age_group_index == "75-84", na.rm = TRUE),
+    age_85_90 = sum(age_group_index == "85-90", na.rm = TRUE),
+    age_over_90 = sum(age_group_index == ">90", na.rm = TRUE),
+    region   = names(sort(table(REGION),  decreasing = TRUE))[1],
+    plan_type= names(sort(table(PLANTYP), decreasing = TRUE))[1],
+    mean_hasbled = mean(hasbled_score, na.rm = TRUE),
+    prop_htn    = 100 * mean(hasbled_htn,    na.rm = TRUE),
+    prop_liver  = 100 * mean(hasbled_liver,  na.rm = TRUE),
+    prop_kidney = 100 * mean(hasbled_kidney, na.rm = TRUE),
+    prop_stroke = 100 * mean(hasbled_stroke, na.rm = TRUE),
+    prop_bleed  = 100 * mean(hasbled_bleed,  na.rm = TRUE),
+    prop_alc    = 100 * mean(hasbled_alc,    na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    mean_age = round(mean_age, 2),
+    sd_age   = round(sd_age,   2),
+    mean_hasbled = round(mean_hasbled, 2),
+    across(c(female_pct, prop_htn, prop_liver, prop_kidney, prop_stroke, prop_bleed, prop_alc), ~ round(., 1))
+  )
+
+# -------------------------
+# 6) Publication-style long Table 1
+# -------------------------
+cases_by_object <- final_table_data %>%
+  group_by(object) %>%
+  summarise(total_cases = n_distinct(ENROLID), .groups = "drop")
+
+cases_summary <- final_table_data %>%
+  group_by(object) %>%
+  summarise(value = n_distinct(ENROLID), .groups = "drop") %>%
+  mutate(Characteristic = "Number of Cases") %>%
+  select(Characteristic, object, value)
+
+obs_summary <- final_table_data %>%
+  group_by(object) %>%
+  summarise(value = sum(total_person_days, na.rm = TRUE), .groups = "drop") %>%
+  mutate(value = format(value, big.mark = ",")) %>%
+  mutate(Characteristic = "Observation Days (Person-days)") %>%
+  select(Characteristic, object, value)
+
+event_summary <- final_table_data %>%
+  group_by(object) %>%
+  summarise(value = n(), .groups = "drop") %>%
+  mutate(Characteristic = "Number of Events") %>%
+  select(Characteristic, object, value)
+
+sex_summary <- final_table_data %>%
+  group_by(object, SEX) %>%
+  summarise(count = n_distinct(ENROLID), .groups = "drop") %>%
+  mutate(SEX = recode(as.character(SEX), "1"="Male","2"="Female")) %>%
+  left_join(cases_by_object, by = "object") %>%
+  mutate(perc = round(100 * count / total_cases, 1),
+         value = paste0(count, " (", perc, "%)"),
+         Characteristic = paste0("Sex: ", SEX)) %>%
+  select(Characteristic, object, value)
+
+age_summary <- final_table_data %>%
+  group_by(object) %>%
+  summarise(mean_age = mean(age_at_index, na.rm = TRUE),
+            sd_age   = sd(age_at_index,   na.rm = TRUE), .groups = "drop") %>%
+  mutate(value = paste0(round(mean_age,2), " (", round(sd_age,2), ")"),
+         Characteristic = "Mean Age (SD)") %>%
+  select(Characteristic, object, value)
+
+agegroup_summary <- final_table_data %>%
+  mutate(age_group = case_when(
+    age_at_index < 45 ~ "18-44",
+    age_at_index < 65 ~ "45-64",
+    age_at_index < 75 ~ "65-74",
+    age_at_index < 85 ~ "75-84",
+    TRUE ~ "85+"
+  )) %>%
+  group_by(object, age_group) %>%
+  summarise(count = n_distinct(ENROLID), .groups = "drop") %>%
+  left_join(cases_by_object, by = "object") %>%
+  mutate(perc = round(100 * count / total_cases, 1),
+         value = paste0(count, " (", perc, "%)"),
+         Characteristic = paste0("Age ", age_group, " (n, %)")) %>%
+  select(Characteristic, object, value)
+
+region_summary <- final_table_data %>%
+  group_by(object, REGION) %>%
+  summarise(count = n_distinct(ENROLID), .groups = "drop") %>%
+  mutate(REGION = recode(as.character(REGION),
+                         "1"="Northeast","2"="North Central","3"="South","4"="West","5"="Unknown")) %>%
+  left_join(cases_by_object, by = "object") %>%
+  mutate(perc = round(100 * count / total_cases, 1),
+         value = paste0(count, " (", perc, "%)"),
+         Characteristic = paste0("Region: ", REGION)) %>%
+  select(Characteristic, object, value)
+
+plan_summary <- final_table_data %>%
+  group_by(object, PLANTYP) %>%
+  summarise(count = n_distinct(ENROLID), .groups = "drop") %>%
+  mutate(PLANTYP = recode(as.character(PLANTYP),
+                          "1"="Basic/major medical","2"="Comprehensive","3"="EPO","4"="HMO",
+                          "5"="POS","6"="PPO","7"="POS with capitation","8"="CDHP","9"="HDHP")) %>%
+  left_join(cases_by_object, by = "object") %>%
+  mutate(perc = round(100 * count / total_cases, 1),
+         value = paste0(count, " (", perc, "%)"),
+         Characteristic = paste0("Plan Type: ", PLANTYP)) %>%
+  select(Characteristic, object, value)
+
+hasbled_score_summary <- final_table_data %>%
+  group_by(object) %>%
+  summarise(mean_hasbled = mean(hasbled_score, na.rm = TRUE), .groups = "drop") %>%
+  mutate(value = as.character(round(mean_hasbled, 2)),
+         Characteristic = "Mean HAS-BLED Score") %>%
+  select(Characteristic, object, value)
+
+htn_summary <- final_table_data %>%
+  group_by(object) %>%
+  summarise(count = sum(hasbled_htn, na.rm = TRUE), .groups = "drop") %>%
+  left_join(cases_by_object, by = "object") %>%
+  mutate(perc = round(100 * count / total_cases, 1),
+         value = paste0(count, " (", perc, "%)"),
+         Characteristic = "HAS-BLED: Hypertension") %>%
+  select(Characteristic, object, value)
+
+liver_summary <- final_table_data %>%
+  group_by(object) %>%
+  summarise(count = sum(hasbled_liver, na.rm = TRUE), .groups = "drop") %>%
+  left_join(cases_by_object, by = "object") %>%
+  mutate(perc = round(100 * count / total_cases, 1),
+         value = paste0(count, " (", perc, "%)"),
+         Characteristic = "HAS-BLED: Liver Dysfunction") %>%
+  select(Characteristic, object, value)
+
+kidney_summary <- final_table_data %>%
+  group_by(object) %>%
+  summarise(count = sum(hasbled_kidney, na.rm = TRUE), .groups = "drop") %>%
+  left_join(cases_by_object, by = "object") %>%
+  mutate(perc = round(100 * count / total_cases, 1),
+         value = paste0(count, " (", perc, "%)"),
+         Characteristic = "HAS-BLED: Kidney Dysfunction") %>%
+  select(Characteristic, object, value)
+
+stroke_summary <- final_table_data %>%
+  group_by(object) %>%
+  summarise(count = sum(hasbled_stroke, na.rm = TRUE), .groups = "drop") %>%
+  left_join(cases_by_object, by = "object") %>%
+  mutate(perc = round(100 * count / total_cases, 1),
+         value = paste0(count, " (", perc, "%)"),
+         Characteristic = "HAS-BLED: Stroke") %>%
+  select(Characteristic, object, value)
+
+bleed_summary <- final_table_data %>%
+  group_by(object) %>%
+  summarise(count = sum(hasbled_bleed, na.rm = TRUE), .groups = "drop") %>%
+  left_join(cases_by_object, by = "object") %>%
+  mutate(perc = round(100 * count / total_cases, 1),
+         value = paste0(count, " (", perc, "%)"),
+         Characteristic = "HAS-BLED: Bleeding Predisposition") %>%
+  select(Characteristic, object, value)
+
+alc_summary <- final_table_data %>%
+  group_by(object) %>%
+  summarise(count = sum(hasbled_alc, na.rm = TRUE), .groups = "drop") %>%
+  left_join(cases_by_object, by = "object") %>%
+  mutate(perc = round(100 * count / total_cases, 1),
+         value = paste0(count, " (", perc, "%)"),
+         Characteristic = "HAS-BLED: Alcohol Use") %>%
+  select(Characteristic, object, value)
+
+# Standardize & bind summaries (prevents type-mix errors)
+.std_summary <- function(df) {
+  df %>%
+    mutate(
+      Characteristic = as.character(Characteristic),
+      object         = as.character(object),
+      value          = as.character(value)
+    ) %>%
+    select(Characteristic, object, value)
+}
+
+all_summaries <- bind_rows(
+  .std_summary(cases_summary),
+  .std_summary(obs_summary),
+  .std_summary(event_summary),
+  .std_summary(sex_summary),
+  .std_summary(age_summary),
+  .std_summary(agegroup_summary),
+  .std_summary(region_summary),
+  .std_summary(plan_summary),
+  .std_summary(hasbled_score_summary),
+  .std_summary(htn_summary),
+  .std_summary(liver_summary),
+  .std_summary(kidney_summary),
+  .std_summary(stroke_summary),
+  .std_summary(bleed_summary),
+  .std_summary(alc_summary)
+)
+
+final_table1 <- all_summaries %>%
+  tidyr::pivot_wider(names_from = object, values_from = value)
+
+# GT table
+pub_table <- final_table1 %>%
+  gt(rowname_col = "Characteristic") %>%
+  tab_header(title = "Table 1: Baseline Characteristics by Drug Group") %>%
+  tab_options(table.font.size = 12, data_row.padding = px(5)) %>%
+  tab_source_note(source_note = "Note: Values are reported as n (%), Mean (SD), or as indicated.")
+
+pub_table
+gtsave(pub_table, "table1.html")
+```
+
+# Generate outcome datasets for each object drug
+
+```{r}
+# Generate outcome datasets for each object -------------------------------
+
+create_oac_dataset_for_loop_outcome <- function(oac) {
+    target <- canon_oac(oac)
+  analytic_cohort_oac_filtered <- analytic_cohort_oac %>%
+    mutate(object = canon_oac(object)) %>%
+    filter(object == target)
+
+  if (nrow(analytic_cohort_oac_filtered) == 0L) {
+    message("No rows for object matching pattern: ", oac)
+    return(tibble(ENROLID = integer(), episode_number = integer()))
+  }
+  
+    # one row per ENROLID-episode with episode-level metadata
+  dataset_for_loop <- analytic_cohort_oac_filtered %>%
+    arrange(ENROLID, episode_number, index_date, bleed_adm_date) %>%             # deterministic
+    distinct(ENROLID, episode_number, .keep_all = TRUE) %>%               # keep first per episode
+    select(
+      ENROLID, index_date, obj_period_end,
+      day_obs_start, day_obs_end,
+      object, episode_number, pre_index_event
+    )
+
+
+  # event-day layout (wide), one row per ENROLID-episode
+  dataset_for_loop_outcome <- analytic_cohort_oac_filtered %>%
+    arrange(ENROLID, episode_number, day_of_event, bleed_adm_date) %>%
+    mutate(
+      day_of_event = as.integer(day_of_event),
+      event_number = as.integer(episode_event_seq)
+    ) %>%
+    select(ENROLID, episode_number, event_number, day_of_event) %>%
+    distinct() %>%
+    pivot_wider(
+      id_cols    = c(ENROLID, episode_number),
+      names_from = event_number,
+      values_from = day_of_event,
+      names_prefix = "event_"
+    )
+  
+  list(
+    dataset_for_loop = dataset_for_loop, 
+    dataset_for_loop_outcome = dataset_for_loop_outcome
+  )
+}
+
+# If your analytic_cohort_oac_2$object still uses long names, call with these:
+outcome_loops_apixaban    <- create_oac_dataset_for_loop_outcome("Apixaban")
+outcome_loops_rivaroxaban <- create_oac_dataset_for_loop_outcome("Rivaroxaban")
+outcome_loops_dabigatran  <- create_oac_dataset_for_loop_outcome("Dabigatran")
+outcome_loops_warfarin    <- create_oac_dataset_for_loop_outcome("Warfarin")
+
+# Pull each cohort from the lists
+dataset_for_loop_apixaban           <- outcome_loops_apixaban$dataset_for_loop
+dataset_for_loop_rivaroxaban        <- outcome_loops_rivaroxaban$dataset_for_loop
+dataset_for_loop_dabigatran         <- outcome_loops_dabigatran$dataset_for_loop
+dataset_for_loop_warfarin           <- outcome_loops_warfarin$dataset_for_loop
+
+dataset_for_loop_outcome_apixaban   <- outcome_loops_apixaban$dataset_for_loop_outcome
+dataset_for_loop_outcome_rivaroxaban<- outcome_loops_rivaroxaban$dataset_for_loop_outcome
+dataset_for_loop_outcome_dabigatran <- outcome_loops_dabigatran$dataset_for_loop_outcome
+dataset_for_loop_outcome_warfarin   <- outcome_loops_warfarin$dataset_for_loop_outcome
+
+```
+
+# Get full concomitant drug data for each object
+
+```{r}
+
+# Use drug extraction function to get names of full drug fills for cohort
+ccaed_2009_2021_full <- extract_drug_name_data(
+  dataset_path = "//pharm-c-psop/TruvenData/Truven Data R/ccae/d", 
+  output_path = NULL, 
+  enrolid_filter = cohort_ids, 
+  ndc_filter = NULL
+)
+mdcrd_2009_2021_full <- extract_drug_name_data(
+  dataset_path = "//pharm-c-psop/TruvenData/Truven Data R/mdcr/d", 
+  output_path = NULL,
+  enrolid_filter = cohort_ids,
+  ndc_filter = NULL
+)
+
+all_drug_full <- bind_rows(ccaed_2009_2021_full, mdcrd_2009_2021_full) 
+
+
+#############
+
+# Helper: safe grace-days and end date (inclusive)
+compute_daysupp <- function(svcdate, daysupp) {
+  daysupp <- coalesce(as.integer(daysupp), 0L)
+  grace   <- as.integer(round(pmin(daysupp * 0.3, 30)))
+  # inclusive supply: + daysupp - 1, then add grace
+  as.Date(svcdate) + (daysupp - 1L + grace)
+}
+
+
+# Define function to collect this for each OAC
+oac_precipitant_processing <- function(oac){
+
+  # Canonicalize the requested OAC up front
+  target <- canon_oac(oac)
+
+  # 1) Select object drug to analyze
+  precipitant_cohort <- analytic_cohort_oac |>
+    mutate(object = canon_oac(object)) |>
+    filter(object == target) |>
+    arrange(ENROLID, index_date) |>
+    distinct(ENROLID, index_date, .keep_all = TRUE) |>
+    select(ENROLID, object, index_date, obj_period_end, day_obs_start, day_obs_end, episode_number)
+
+  # 2) Pare down all_drug_full for only ids above
+  oac_specific_precipitants <- all_drug_full |>
+    filter(ENROLID %in% precipitant_cohort$ENROLID) |>
+    filter(!is.na(GENNME), GENNME != "")
+
+  # 3) Join and limit to drugs used during the object window
+  #    Build a case-insensitive pattern for all DOACs to exclude them:
+  oac_re <- paste0("(?i)\\b(", paste(oac_drug_list, collapse = "|"), ")\\b")
+
+  precipitant_cohort_2 <- precipitant_cohort |>
+    left_join(oac_specific_precipitants, by = "ENROLID") |>
+    arrange(ENROLID, SVCDATE) |>
+    mutate(
+      precip_start = SVCDATE,
+      precip_end   = compute_daysupp(SVCDATE, DAYSUPP)
+    ) |>
+    filter(precip_start <= obj_period_end & precip_end >= index_date) |>
+    mutate(doac = str_detect(GENNME, oac_re)) |>
+    filter(doac == FALSE) |>
+    select(-doac)
+
+  # 4) Exclusions (guard against NAs)
+  precipitant_cohort_3 <- precipitant_cohort_2 |>
+    mutate(
+      MASTFRM  = if_else(is.na(MASTFRM),  "", MASTFRM),
+      THRDTDS  = if_else(is.na(THRDTDS),  "", THRDTDS),
+      GENNME   = if_else(is.na(GENNME),   "", GENNME)
+    ) |>
+    filter(
+      !MASTFRM %in% excluded_mastfrm,
+      !THRDTDS %in% excluded_thrdtds,
+      !str_detect(THRDTDS, "S/M"),
+      !GENNME %in% excluded_gennme
+    )
+
+  # 5) Pull out individual drugs; split combo products
+  precipitant_active_ingredients <- precipitant_cohort_3 |>
+    tidyr::separate_rows(GENNME, sep = "[:/;]") |>
+    mutate(GENNME = str_trim(GENNME)) |>
+    filter(GENNME != "") |>
+    select(ENROLID, index_date, GENNME)
+
+  # 6) Mapping (read your curated mapping table)
+  drug_mapping <- read_excel("C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/codes/drug_mapping.xlsx")
+  # Expect columns: GENNME (original), NEWNAME (clean)
+
+  # First use mapping to standardize the simple list (for counting)
+  precipitant_active_ingredient_mapped <- precipitant_active_ingredients |>
+    left_join(drug_mapping, by = "GENNME") |>
+    mutate(GENNME = if_else(is.na(NEWNAME), GENNME, NEWNAME)) |>
+    select(-NEWNAME) |>
+    filter(!GENNME %in% c("", "Pl", "Solution, Multi Ingredient", "IF", "N"))
+
+  # 7) Keep drugs with >=5 unique ENROLIDs
+  drug_counts <- precipitant_active_ingredient_mapped |>
+    group_by(GENNME) |>
+    summarise(unique_enrolid_count = n_distinct(ENROLID), .groups = "drop") |>
+    filter(unique_enrolid_count > 4)
+
+  precipitant_vector <- unique(drug_counts$GENNME)
+
+  # 8) Apply mapping to the big dataset (string replace over whole strings)
+  #    Keep your loop for exact word matches; works fine given free text.
+  replace_drug_names_in_string <- function(drug_string, mapping) {
+    for (i in seq_len(nrow(mapping))) {
+      pattern <- paste0("\\b", mapping$GENNME[i], "\\b")
+      drug_string <- gsub(pattern, mapping$NEWNAME[i], drug_string, ignore.case = FALSE)
+    }
+    drug_string
+  }
+
+  precipitant_cohort_4 <- precipitant_cohort_3 |>
+    mutate(GENNME = sapply(GENNME, replace_drug_names_in_string, mapping = drug_mapping))
+
+  # 9) Clean canceling / sequential claims (your custom funcs)
+  precipitant_cohort_cleaned <- precipitant_cohort_4 |>
+    clean_canceling_claims() |>
+    remove_sequential_pairs() |>
+    select_max_fill()
+
+  # 10) Create exposure spans relative to index and keep overlap with obs window
+  precipitant_cohort_refined <- precipitant_cohort_cleaned |>
+    rename(
+      expo_start_date = SVCDATE,
+      expo_end_date   = precip_end,
+      precipitant     = GENNME
+    ) |>
+    select(ENROLID, object, day_obs_start, day_obs_end, index_date, obj_period_end,
+           precipitant, expo_start_date, expo_end_date, episode_number) |>
+    mutate(
+      day_exposure_start = as.numeric(expo_start_date - index_date),
+      day_exposure_end   = as.numeric(expo_end_date   - index_date)
+    ) |>
+    filter(day_exposure_start <= day_obs_end, day_exposure_end >= 0) |>
+    mutate(
+      nsaid          = str_detect(precipitant, paste(nsaids, collapse = "|")),
+      antiplatelet   = str_detect(precipitant, paste(antiplatelet, collapse = "|")),
+      other_anticoag = str_detect(precipitant, paste(other_anticoag, collapse = "|")),
+      ssri_snri      = str_detect(precipitant, paste(ssri_snri, collapse = "|")),
+      giprotect      = str_detect(precipitant, paste(giprotect, collapse = "|"))
+    ) |>
+    arrange(ENROLID, day_obs_start)
+
+  return(list(cohort = precipitant_cohort_refined, vector = precipitant_vector))
+}
+
+
+
+# Initialize a list to store the results for each OAC
+oac_results <- list()
+
+# Run the function for each OAC and store both the cohort and the vector
+oac_results$apixaban <- oac_precipitant_processing("Apixaban")
+oac_results$rivaroxaban <- oac_precipitant_processing("Rivaroxaban")
+oac_results$dabigatran <- oac_precipitant_processing("Dabigatran")
+oac_results$warfarin <- oac_precipitant_processing("Warfarin")
+
+#Pull each cohort from the list
+# Access the cohort for Apixaban
+apixaban_cohort <- oac_results$apixaban$cohort
+rivaroxaban_cohort <- oac_results$rivaroxaban$cohort
+dabigatran_cohort <- oac_results$dabigatran$cohort
+warfarin_cohort <- oac_results$warfarin$cohort
+
+# Access the precipitant vector for each
+apixaban_vector <- oac_results$apixaban$vector
+rivaroxaban_vector <- oac_results$rivaroxaban$vector
+dabigatran_vector <- oac_results$dabigatran$vector
+warfarin_vector <- oac_results$warfarin$vector
+
+# warfarin_vector
+# write.csv(warfarin_vector, "sorted_drugs.csv", row.names = FALSE)
+```
+
+```{r}
+# ===============================
+# Save datasets for each OAC
+# ===============================
+
+
+# Apixaban
+write_rds(dataset_for_loop_apixaban, file.path(proj_root, "/data/loop_datasets/dataset_for_loop_apixaban.rds"))
+write_rds(dataset_for_loop_outcome_apixaban, file.path(proj_root, "/data/loop_datasets/dataset_for_loop_outcome_apixaban.rds"))
+write_rds(apixaban_cohort, file.path(proj_root, "/data/loop_datasets/apixaban_cohort.rds"))
+write_rds(apixaban_vector, file.path(proj_root, "/data/loop_datasets/apixaban_vector.rds"))
+
+# Rivaroxaban
+write_rds(dataset_for_loop_rivaroxaban, file.path(proj_root, "/data/loop_datasets/dataset_for_loop_rivaroxaban.rds"))
+write_rds(dataset_for_loop_outcome_rivaroxaban, file.path(proj_root, "/data/loop_datasets/dataset_for_loop_outcome_rivaroxaban.rds"))
+write_rds(rivaroxaban_cohort, file.path(proj_root, "/data/loop_datasets/rivaroxaban_cohort.rds"))
+write_rds(rivaroxaban_vector, file.path(proj_root, "/data/loop_datasets/rivaroxaban_vector.rds"))
+
+# Dabigatran
+write_rds(dataset_for_loop_dabigatran, file.path(proj_root, "/data/loop_datasets/dataset_for_loop_dabigatran.rds"))
+write_rds(dataset_for_loop_outcome_dabigatran, file.path(proj_root, "/data/loop_datasets/dataset_for_loop_outcome_dabigatran.rds"))
+write_rds(dabigatran_cohort, file.path(proj_root, "/data/loop_datasets/dabigatran_cohort.rds"))
+write_rds(dabigatran_vector, file.path(proj_root, "/data/loop_datasets/dabigatran_vector.rds"))
+
+# Warfarin
+write_rds(dataset_for_loop_warfarin, file.path(proj_root, "/data/loop_datasets/dataset_for_loop_warfarin.rds"))
+write_rds(dataset_for_loop_outcome_warfarin, file.path(proj_root, "/data/loop_datasets/dataset_for_loop_outcome_warfarin.rds"))
+write_rds(warfarin_cohort, file.path(proj_root, "/data/loop_datasets/warfarin_cohort.rds"))
+write_rds(warfarin_vector, file.path(proj_root, "/data/loop_datasets/warfarin_vector.rds"))
+
+
+# ===============================
+# Reload datasets (if needed)
+# ===============================
+
+# Apixaban
+dataset_for_loop_apixaban         <- read_rds(file.path(proj_root, "data/loop_datasets/dataset_for_loop_apixaban.rds"))
+dataset_for_loop_outcome_apixaban <- read_rds(file.path(proj_root, "data/loop_datasets/dataset_for_loop_outcome_apixaban.rds"))
+apixaban_cohort                   <- read_rds(file.path(proj_root, "data/loop_datasets/apixaban_cohort.rds"))
+apixaban_vector                   <- read_rds(file.path(proj_root, "data/loop_datasets/apixaban_vector.rds"))
+
+# Rivaroxaban
+dataset_for_loop_rivaroxaban         <- read_rds(file.path(proj_root, "data/loop_datasets/dataset_for_loop_rivaroxaban.rds"))
+dataset_for_loop_outcome_rivaroxaban <- read_rds(file.path(proj_root, "data/loop_datasets/dataset_for_loop_outcome_rivaroxaban.rds"))
+rivaroxaban_cohort                   <- read_rds(file.path(proj_root, "data/loop_datasets/rivaroxaban_cohort.rds"))
+rivaroxaban_vector                   <- read_rds(file.path(proj_root, "data/loop_datasets/rivaroxaban_vector.rds"))
+
+# Dabigatran
+dataset_for_loop_dabigatran         <- read_rds(file.path(proj_root, "data/loop_datasets/dataset_for_loop_dabigatran.rds"))
+dataset_for_loop_outcome_dabigatran <- read_rds(file.path(proj_root, "data/loop_datasets/dataset_for_loop_outcome_dabigatran.rds"))
+dabigatran_cohort                   <- read_rds(file.path(proj_root, "data/loop_datasets/dabigatran_cohort.rds"))
+dabigatran_vector                   <- read_rds(file.path(proj_root, "data/loop_datasets/dabigatran_vector.rds"))
+
+# Warfarin
+dataset_for_loop_warfarin         <- read_rds(file.path(proj_root, "data/loop_datasets/dataset_for_loop_warfarin.rds"))
+dataset_for_loop_outcome_warfarin <- read_rds(file.path(proj_root, "data/loop_datasets/dataset_for_loop_outcome_warfarin.rds"))
+warfarin_cohort                   <- read_rds(file.path(proj_root, "data/loop_datasets/warfarin_cohort.rds"))
+warfarin_vector                   <- read_rds(file.path(proj_root, "data/loop_datasets/warfarin_vector.rds"))
+
+
+```
+
+# Run SCCS Loop
+
+```{r}
+### 10/24/25 Chat GPT gave this which has toggles for adjustment. no idea if it works...### unadjusted check. adjust_30 changed to true. check apap to see if same.10/25 - unadjusted toggle and adjusted toggle both work (APAP unchanged) - need to test an antiplatelet to see if unchanged since or maybe some other med...could just look to see if change from previous results to these results...can run unadjusted and save, then run adjusted and save and compare...
+
+#10/29 - didn't do above because the estimates look reasonable. will need to shrink them and see how many hits I have remaining...17 significant shrunk results before...we will see if this changes. need to be able to save after I run the loop so I don't lose everything when my computer inevitably crashes again. Need to repeat with lisinopril as well. also, need to review loop line by line and comment out what is happening...
+
+# ===========================
+# SCCS loop — Poisson FE primary (with 30d-covariate toggle)
+# ===========================
+if (!requireNamespace("data.table", quietly=TRUE)) install.packages("data.table")
+if (!requireNamespace("gnm", quietly=TRUE))        install.packages("gnm")
+if (!requireNamespace("survival", quietly=TRUE))   install.packages("survival")
+suppressPackageStartupMessages({ library(data.table); library(gnm); library(survival) })
+
+# ------------ RUN-TIME TOGGLES ------------
+ADJUST_30DAY        <- TRUE    # TRUE = add 30-day covariates built from daily class exposure flags
+DROP_SAME_CLASS     <- TRUE    # If adjusting, drop same-class covariate (e.g., precipitant is an NSAID -> drop NSAID_30_OLDBIN)
+USE_CLOGIT_FALLBACK <- TRUE    # If Poisson FE cannot identify, try clogit on eligible strata
+USE_TEST_VECTOR     <- FALSE    # If TRUE, force all objects to use 'test_vector' below
+
+# Global knobs
+match_mode      <- "broad"     # "broad" keeps APAP expansions; otherwise "substring" is typical
+include_washout <- TRUE
+washout_days    <- 7L
+
+# ------------ Helpers ------------
+`%||%` <- function(a, b) { if (!is.null(a) && length(a) > 0) a else b }
+regex_escape <- function(x) gsub("([][{}()+*.^$|?\\\\])", "\\\\\\1", x)
+.any_grepl <- function(x, pats) {
+  if (length(x) == 0L) return(logical(0))
+  apply(simplify2array(lapply(pats, function(p) grepl(p, x, ignore.case = TRUE, perl = TRUE))), 1, any)
+}
+.wald_stats <- function(est, se) {
+  z <- est / se
+  p <- 2 * pnorm(abs(z), lower.tail = FALSE)
+  list(z_value = z, p_value = p,
+       L = exp(est - 1.96*se),
+       U = exp(est + 1.96*se))
+}
+
+# Broad APAP patterns (only used when match_mode="broad")
+acet_broad_patterns <- c(
+  "acetaminophen","paracetamol","\\bAPAP\\b","-apap","/apap"," apap",
+  "\\btylenol\\b","\\bpanadol\\b","\\bmapap\\b","ofirmev"
+)
+
+# Optional class map (only used if DROP_SAME_CLASS & ADJUST_30DAY)
+class_of <- function(drug_name) {
+  p <- tolower(drug_name)
+  if (exists("nsaids")         && p %in% tolower(nsaids))         return("nsaid")
+  if (exists("antiplatelet")   && p %in% tolower(antiplatelet))   return("antiplatelet")
+  if (exists("other_anticoag") && p %in% tolower(other_anticoag)) return("other_anticoag")
+  if (exists("ssri_snri")      && p %in% tolower(ssri_snri))      return("ssri_snri")
+  if (exists("giprotect")      && p %in% tolower(giprotect))      return("giprotect")
+  return(NA_character_)
+}
+
+# ---- Build daily class exposure flags from the refined cohort ----
+# Expects object_cohort to contain: ENROLID, episode_number, day_exposure_start, day_exposure_end, and boolean flags:
+#   nsaid, antiplatelet, other_anticoag, ssri_snri, giprotect
+generate_covariate_data <- function(control_dt, covariate_col) {
+  setDT(control_dt)
+  expos <- control_dt[get(covariate_col) == TRUE &
+                        !is.na(day_exposure_start) & !is.na(day_exposure_end),
+                      .(ENROLID, episode_number,
+                        exp_start = as.integer(day_exposure_start),
+                        exp_end   = as.integer(day_exposure_end))]
+  expos <- expos[exp_end >= exp_start]
+  if (nrow(expos) == 0L) {
+    out <- data.table(ENROLID=integer(), episode_number=integer(), day=integer(), val=integer())
+    setnames(out, "val", paste0(covariate_col, "_exposed"))
+    return(out[])
+  }
+  # Build per-day flags by episode range (wide episode window)
+  days <- unique(expos[, .(ENROLID, episode_number)])
+  days <- control_dt[days, on=.(ENROLID, episode_number), nomatch=0L][
+    , .(day = seq.int(min(day_obs_start, na.rm=TRUE), max(day_obs_end, na.rm=TRUE))),
+    by = .(ENROLID, episode_number)]
+  days[, val := 0L]
+  days[expos, on=.(ENROLID, episode_number, day >= exp_start, day <= exp_end), val := 1L]
+  setnames(days, "val", paste0(covariate_col, "_exposed"))
+  days[]
+}
+
+# 30-day covariate builders (only used if ADJUST_30DAY = TRUE)
+add_30d_OLDBIN <- function(dt,
+                           covs = c("nsaid","antiplatelet","other_anticoag","ssri_snri","giprotect"),
+                           id_cols = c("ENROLID","episode_number")) {
+  data.table::setorder(dt, ENROLID, episode_number, day)
+  for (nm in covs) {
+    exp_col <- paste0(nm, "_exposed")
+    out_col <- paste0(nm, "_30_OLDBIN")
+    if (out_col %in% names(dt)) dt[, (out_col) := NULL]
+    if (!(exp_col %in% names(dt))) { dt[, (exp_col) := 0L]; }
+    dt[, (out_col) := {
+      x <- as.integer(get(exp_col))
+      r_any <- as.integer(data.table::frollsum(x, 30, align="right", fill=0L) > 0L)
+      as.integer(r_any == 1L | x == 1L)  # include "today"
+    }, by = id_cols]
+  }
+  dt[]
+}
+
+# ------------ Build daily panel for ONE object×drug ------------
+build_panel <- function(object_data, object_cohort, outcome_dataset,
+                        drug_label,
+                        match_mode = c("substring","exact","broad"),
+                        include_washout = TRUE, washout_days = 7L) {
+  match_mode <- match.arg(match_mode)
+
+  # Base daily panel per episode
+  base <- as.data.table(object_data)[
+    , .(day = seq(day_obs_start, day_obs_end)),
+    by = .(ENROLID, episode_number)
+  ][, day := as.integer(day)]
+
+  pd <- as.data.table(object_cohort)
+
+  # Exposure rows by match mode
+  expos <- switch(match_mode,
+    exact = pd[tolower(precipitant) == tolower(drug_label)],
+    substring = { pat <- regex_escape(drug_label); pd[grepl(pat, precipitant, ignore.case=TRUE, perl=TRUE)] },
+    broad = {
+      if (tolower(drug_label) %in% c("acetaminophen","paracetamol")) {
+        pd[.any_grepl(precipitant, acet_broad_patterns)]
+      } else {
+        pat <- regex_escape(drug_label); pd[grepl(pat, precipitant, ignore.case=TRUE, perl=TRUE)]
+      }
+    }
+  )
+
+  # Mark exposed days
+  expos <- expos[!is.na(day_exposure_start) & !is.na(day_exposure_end)]
+  expos[, `:=`(exp_start = as.integer(day_exposure_start),
+               exp_end   = as.integer(day_exposure_end))]
+  expos <- expos[exp_end >= exp_start]
+  base[, exposed := 0L]
+  if (nrow(expos)) {
+    base[expos[, .(ENROLID, episode_number, exp_start, exp_end)],
+         on = .(ENROLID, episode_number, day >= exp_start, day <= exp_end),
+         exposed := 1L]
+  }
+
+  # Events (any columns starting with "event")
+  ev_cols <- grep("^event", names(outcome_dataset), value = TRUE)
+  base[, event := 0L]
+  if (length(ev_cols)) {
+    ev_long <- melt(as.data.table(outcome_dataset),
+                    id.vars = c("ENROLID","episode_number"),
+                    measure.vars = ev_cols,
+                    value.name = "event_day",
+                    na.rm = TRUE)[, .(ENROLID, episode_number, event_day)]
+    if (nrow(ev_long)) {
+      ev_long[, event_day := as.integer(event_day)]
+      base[ev_long, on = .(ENROLID, episode_number, day = event_day), event := 1L]
+    }
+  }
+
+  # Optional washout exclusion
+  if (!isTRUE(include_washout)) {
+    tmp <- copy(base)
+    tmp[, last_exp := fifelse(exposed == 1L, day, NA_integer_), by = .(ENROLID, episode_number)]
+    tmp[, last_exp := nafill(last_exp, "locf"),                  by = .(ENROLID, episode_number)]
+    tmp[, washout := as.integer(exposed == 0L & (day - last_exp) %between% c(1L, as.integer(washout_days))),
+        by = .(ENROLID, episode_number)]
+    tmp[is.na(washout), washout := 0L]
+    base <- tmp[washout == 0L][, `:=`(last_exp = NULL, washout = NULL)]
+  }
+
+  # ---- FIXED MERGE (no i.get) ----
+  cov_classes <- c("nsaid","antiplatelet","other_anticoag","ssri_snri","giprotect")
+  for (cc in cov_classes) {
+    col <- paste0(cc, "_exposed")
+    if (!(col %in% names(base))) base[, (col) := 0L]  # initialize to 0
+    cov_dt <- generate_covariate_data(pd, cc)
+    if (nrow(cov_dt)) {
+      # Set to 1 for matched (exposed) days; stays 0 elsewhere
+      base[cov_dt, on=.(ENROLID, episode_number, day), (col) := 1L]
+    }
+    base[, (col) := as.integer(get(col))]  # ensure integer
+  }
+
+  base[, unique_id := factor(paste0(ENROLID, ":", episode_number))]
+  base[]
+}
+
+# ------------ Fit ONE cell (Poisson FE primary; optional adjustment; clogit fallback) ------------
+fit_cell <- function(object_name, object_data, object_cohort, outcome_data,
+                     drug_label,
+                     match_mode = c("substring","exact","broad"),
+                     include_washout = TRUE, washout_days = 7L) {
+  match_mode <- match.arg(match_mode)
+  panel <- build_panel(object_data, object_cohort, outcome_data,
+                       drug_label, match_mode, include_washout, washout_days)
+
+  # SCCS conditioning: keep only strata with ≥1 event
+  df <- panel[, has_event := any(event == 1L), by = unique_id][has_event == TRUE][]
+  df[, has_event := NULL]
+  if (!nrow(df)) {
+    return(data.table(object=object_name, drug=drug_label,
+                      Estimate=NA_real_, IRR=NA_real_, SE=NA_real_,
+                      z_value=NA_real_, p_value=NA_real_,
+                      Lower95=NA_real_, Upper95=NA_real_,
+                      method="none", reason="no_event_strata"))
+  }
+
+  # Identifiability: require within-ID exposure variation
+  df <- df[, vary := (min(exposed) == 0L & max(exposed) == 1L), by = unique_id][vary == TRUE][]
+  df[, vary := NULL]
+  if (!nrow(df)) {
+    return(data.table(object=object_name, drug=drug_label,
+                      Estimate=NA_real_, IRR=NA_real_, SE=NA_real_,
+                      z_value=NA_real_, p_value=NA_real_,
+                      Lower95=NA_real_, Upper95=NA_real_,
+                      method="none", reason="no_within_id_exposure_variation"))
+  }
+
+  # ------- Primary: Poisson FE via gnm -------
+  if (isTRUE(ADJUST_30DAY)) {
+    df <- add_30d_OLDBIN(df)
+    cov_pool <- c("nsaid_30_OLDBIN","antiplatelet_30_OLDBIN","other_anticoag_30_OLDBIN","ssri_snri_30_OLDBIN","giprotect_30_OLDBIN")
+    present <- intersect(cov_pool, names(df))
+    drop_nv <- names(which(sapply(df[, ..present], function(x) length(unique(x)) < 2)))
+    keep_cov <- setdiff(present, drop_nv)
+    if (isTRUE(DROP_SAME_CLASS)) {
+      same <- class_of(drug_label)
+      if (!is.na(same)) keep_cov <- setdiff(keep_cov, paste0(same, "_30_OLDBIN"))
+    }
+    rhs <- if (length(keep_cov)) paste("exposed +", paste(keep_cov, collapse=" + ")) else "exposed"
+  } else {
+    rhs <- "exposed"
+  }
+
+  fml <- as.formula(paste("event ~", rhs))
+  fit <- tryCatch(gnm(fml, eliminate = unique_id, family = poisson(), data = df), error = function(e) e)
+
+  extract <- function(fitobj, method_tag, reason_txt) {
+    sm <- summary(fitobj)$coefficients
+    if (!"exposed" %in% rownames(sm)) return(NULL)
+    est <- sm["exposed","Estimate"]; se <- sm["exposed","Std. Error"]
+    if (!is.finite(est) || !is.finite(se)) return(NULL)
+    ws <- .wald_stats(est, se)
+    data.table(object=object_name, drug=drug_label,
+               Estimate=est, IRR=exp(est), SE=se,
+               z_value=ws$z_value, p_value=ws$p_value,
+               Lower95=ws$L, Upper95=ws$U,
+               method=method_tag, reason=reason_txt)
+  }
+
+  if (!inherits(fit, "error")) {
+    reason_txt <- if (rhs == "exposed") "unadjusted" else paste0("adjusted: ", sub("^exposed \\+ ", "", rhs))
+    out <- extract(fit, "poisson_fe", reason_txt)
+    if (!is.null(out)) return(out)
+  }
+
+  # GLM FE fallback
+  if (length(unique(df$unique_id)) > 1L) {
+    fml_glm <- as.formula(paste("event ~", rhs, "+ factor(unique_id)"))
+    fit_glm <- tryCatch(glm(fml_glm, family = poisson(), data = df), error = function(e) e)
+    if (!inherits(fit_glm, "error")) {
+      reason_txt <- if (rhs == "exposed") "unadjusted" else paste0("adjusted: ", sub("^exposed \\+ ", "", rhs))
+      out <- extract(fit_glm, "glm_fe_fallback", reason_txt)
+      if (!is.null(out)) return(out)
+    }
+  }
+
+  # Optional: clogit fallback
+  if (isTRUE(USE_CLOGIT_FALLBACK)) {
+    case_exp <- df[event == 1L, .(case_exposed = as.integer(any(exposed == 1L))), by = unique_id]
+    ctrl_exp <- df[event == 0L, .(ctrl_has0 = any(exposed == 0L), ctrl_has1 = any(exposed == 1L)), by = unique_id]
+    eli <- merge(case_exp, ctrl_exp, by = "unique_id", all.x = TRUE)
+    eli[is.na(ctrl_has0), ctrl_has0 := FALSE]
+    eli[is.na(ctrl_has1), ctrl_has1 := FALSE]
+    eli[, eligible := (case_exposed == 1L & ctrl_has0) | (case_exposed == 0L & ctrl_has1)]
+    elig_ids <- eli[eligible == TRUE, unique_id]
+
+    if (length(elig_ids) > 0L) {
+      dxc <- df[unique_id %in% elig_ids, .(event, exposed, unique_id)]
+      fitc <- tryCatch(clogit(event ~ exposed + strata(unique_id), data = dxc, method = "efron"),
+                       error = function(e) e)
+      if (!inherits(fitc, "error")) {
+        smc <- summary(fitc)$coefficients
+        if ("exposed" %in% rownames(smc) && is.finite(smc["exposed","coef"]) && is.finite(smc["exposed","se(coef)"])) {
+          est <- smc["exposed","coef"]; se <- smc["exposed","se(coef)"]
+          ws <- .wald_stats(est, se)
+          return(data.table(object=object_name, drug=drug_label,
+                            Estimate=est, IRR=exp(est), SE=se,
+                            z_value=ws$z_value, p_value=ws$p_value,
+                            Lower95=ws$L, Upper95=ws$U,
+                            method="clogit", reason="poisson_failed; clogit_fallback"))
+        }
+      }
+    }
+  }
+
+  data.table(object=object_name, drug=drug_label,
+             Estimate=NA_real_, IRR=NA_real_, SE=NA_real_,
+             z_value=NA_real_, p_value=NA_real_,
+             Lower95=NA_real_, Upper95=NA_real_,
+             method="none", reason="all_engines_failed")
+}
+
+# ------------ Driver over all objects ------------
+# Expect: dataset_for_loop_*, *_cohort (precipitant_cohort_refined), *_outcome, and *_vector present
+objs <- list(
+  list(name="Apixaban",    data=dataset_for_loop_apixaban,    cohort=apixaban_cohort,    outcome=dataset_for_loop_outcome_apixaban,    vector=if (USE_TEST_VECTOR) test_vector else apixaban_vector),
+  list(name="Rivaroxaban", data=dataset_for_loop_rivaroxaban, cohort=rivaroxaban_cohort, outcome=dataset_for_loop_outcome_rivaroxaban, vector=if (USE_TEST_VECTOR) test_vector else rivaroxaban_vector),
+  list(name="Dabigatran",  data=dataset_for_loop_dabigatran,  cohort=dabigatran_cohort,  outcome=dataset_for_loop_outcome_dabigatran,  vector=if (USE_TEST_VECTOR) test_vector else dabigatran_vector),
+  list(name="Warfarin",    data=dataset_for_loop_warfarin,    cohort=warfarin_cohort,    outcome=dataset_for_loop_outcome_warfarin,   vector=if (USE_TEST_VECTOR) test_vector else warfarin_vector)
+)
+
+run_scan <- function(objs, match_mode="broad", include_washout=TRUE, washout_days=7L) {
+  out <- rbindlist(lapply(objs, function(o) {
+    v <- o$vector %||% character(0)
+    v <- as.character(v); v <- v[!is.na(v) & nzchar(v)]
+    if (!length(v)) return(data.table())
+    rbindlist(lapply(v, function(drug) {
+      message("Processing ", o$name, " | ", drug)
+      fit_cell(o$name, o$data, o$cohort, o$outcome,
+               drug, match_mode, include_washout, washout_days)
+    }), use.names=TRUE, fill=TRUE)
+  }), use.names=TRUE, fill=TRUE)
+  if (!nrow(out)) return(out[])
+  out[, variance := SE^2]
+  data.table::setorder(out, object, drug)
+  out[]
+}
+
+
+# --- Run unadjusted ---
+ADJUST_30DAY <- FALSE
+res_unadj <- run_scan(objs, match_mode = match_mode, include_washout = include_washout, washout_days = washout_days)
+
+data.table::fwrite(res_unadj, file.path(proj_root, "results/sccs_results_unadjusted.csv"))
+saveRDS(res_unadj, file.path(proj_root, "results/sccs_results_unadjusted.rds"))
+
+rm(res_unadj); gc()   # clear memory
+
+# --- Run adjusted ---
+ADJUST_30DAY <- TRUE
+res_adj <- run_scan(objs, match_mode = match_mode, include_washout = include_washout, washout_days = washout_days)
+
+data.table::fwrite(res_adj, file.path(proj_root, "results/sccs_results_adjusted.csv"))
+saveRDS(res_adj, file.path(proj_root, "results/sccs_results_adjusted.rds"))
+
+rm(res_adj); gc()
+
+# # Example: filter to significant results without dplyr
+# results_filtered <- results[!is.na(p_value) & p_value <= 0.05]
+# print(results_filtered)
+
+```
