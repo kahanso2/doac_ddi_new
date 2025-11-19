@@ -37,7 +37,7 @@ options(scipen = 999)
 
 oac_drug_list <- c("Warf", "Apix", "Rivarox", "Dabig", "Edoxa")
 neg_control <- "Lisinopril"
-
+oac_generic <- c("Apixaban", "Rivaroxaban", "Rivaroxaban;Rivaroxaban", "Dabigatran Etexilate Mesylate", "Edoxaban", "Warfarin Sodium")
 
 ```
 
@@ -362,12 +362,11 @@ cleaned_drug_data <- clean_drug_data_dt(all_drug_neg_con_2009_2021)
 write_parquet(cleaned_drug_data, file.path(proj_root, "data", "control", "cleaned_drug_data.parquet"))
 
 # Open dataset later without rerunning cleaning ────────────────────
-# cleaned_drug_data <- read_parquet(cleaned_drug_data, file.path(proj_root, "data", "control", "cleaned_drug_data.parquet"))
+# cleaned_drug_data <- read_parquet(file.path(proj_root, "data", "control", "cleaned_drug_data.parquet"))
 ```
 
 # Test - Assign Index Date - works, but need to compare with other code, which can only be done on OAC. In OAC need to gorup by GENNME I think (see ChatGPT) "Optimize data cleaning"
 ```{r}
-library(data.table)
 
 # ==========================================================
 # Post-clean steps in data.table (scales to 100M+ rows)
@@ -464,7 +463,7 @@ postclean_assign_rules_dt <- function(df,
 # ======================
 # Example usage:
 # (Assuming `cleaned_drug_data` from your earlier cleaner that retains AGE)
-final_dt <- postclean_assign_rules_dt(
+all_neg_con_index <- postclean_assign_rules_dt(
   cleaned_drug_data,
   adherence_multiplier = 0.70,   # 70% adherent -> grace = 30% of DAYSUPP (capped by `cap`)
   cap = 30L,
@@ -475,57 +474,23 @@ final_dt <- postclean_assign_rules_dt(
 )
 
 
+# ── Save dataset so we don't have to redo ───────────────────────────────────────
+write_parquet(all_neg_con_index, file.path(proj_root, "data", "control", "all_neg_con_index.parquet"))
 
-```
-
-# Assign Index Date
-
-```{r}
-
-#Apply functions to create index dates and age-eligible population
-all_neg_con_index <- cleaned_drug_data |> 
-  arrange(ENROLID, SVCDATE) |> 
-  calculate_drug_end_plus_grace(adherence_multiplier = 0.3, cap = 30) |> 
-  flag_gaps_and_assign_episodes(gap_allowed = 183) |> 
-  assign_index_date_and_med() |> 
-  filter_new_users_age(earliest_index_date = '2009-07-02', age_criteria = 18)
-
-
-# ── Exclude patients with ≥2 distinct OACs on the *index date* ────────────────
-# Index date is the first OAC fill. We look only at fills on that date and count distinct OAC names.
-
-
-ambiguous_ids <- all_neg_con_index |>
-  filter(GENNME %in% neg_control, SVCDATE == index_date) |>
-  group_by(ENROLID, episode_number, index_date) |>
-  summarise(n_neg_control = n_distinct(GENNME), .groups = "drop") |>
-  filter(n_neg_control >= 2) |>
-  distinct(ENROLID) |>
-  pull()
-
-message("Excluding ", length(unique(ambiguous_ids)),
-        " patients with multiple distinct OACs on their index date.")
-
-all_oac_index <- all_oac_index |>
-  filter(!ENROLID %in% ambiguous_ids)
-  
-# Save dataset so don't have to do that again
-all_oac_index |> write_parquet("C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/all_oac_index.parquet")
-
-# Open dataset
-# all_oac_index <- read_parquet("C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/all_oac_index.parquet")
+# Open dataset later without rerunning cleaning ────────────────────
+# all_neg_con_index <- read_parquet(file.path(proj_root, "data", "control", "all_neg_con_index.parquet"))
 
 #Extract unique IDs of OAC users meeting criteria  
-all_drug_index_ids <- unique(all_oac_index$ENROLID) #2057997
-
+all_drug_index_ids <- unique(all_neg_con_index$ENROLID) #9363333
 ```
+
 
 # Continuous enrollment
 
 ```{r}
 
 # ── IDs + index date for CE assessment ────────────────────────────────────────
-cohort_ids_for_CE <- all_oac_index |>
+cohort_ids_for_CE <- all_neg_con_index |>
   arrange(ENROLID, index_date) |>
   select(ENROLID, index_date) |>
   distinct() |>
@@ -561,7 +526,13 @@ continuous_enrollment_result <- ContinuousEnrollment(
 
 # ── Vector of IDs with CE ─────────────────────────────────────────────────────
 ids_with_ce <- unique(continuous_enrollment_result$ENROLID)
-message("CE-kept IDs: ", length(ids_with_ce))
+message("CE-kept IDs: ", length(ids_with_ce)) # 5898457
+
+write_parquet(continuous_enrollment_result, file.path(proj_root, "data", "control", "continuous_enrollment_result.parquet")) 
+
+# Read in files
+# read_parquet(file.path(proj_root, "data", "control", "continuous_enrollment_result.parquet")) 
+# ids_with_ce <- unique(continuous_enrollment_result$ENROLID)
 
 
 ```
@@ -570,10 +541,10 @@ message("CE-kept IDs: ", length(ids_with_ce))
 
 ```{r}
 # Create parquet file of T datasets with relevant IDs
-all_enroll |> write_parquet("C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/enrollment_parquet.parquet") 
+write_parquet(all_enroll, file.path(proj_root, "data", "control", "enrollment_parquet.parquet")) 
 
 # Read parquet file back into the environment
-enrollment_parquet <- read_parquet("C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/enrollment_parquet.parquet") 
+enrollment_parquet <- read_parquet(file.path(proj_root, "data", "control", "enrollment_parquet.parquet")) 
 
 max_gap <- 30
 
@@ -603,85 +574,148 @@ disenrollment <- enrollment_parquet |>
 b <- cohort_ids_for_CE |> 
   filter(ENROLID %in% ids_with_ce) |> 
   left_join(disenrollment, by = "ENROLID") |> 
+  mutate(index_date = as.Date(index_date), 
+         ENROLID    = as.character(ENROLID)) |> 
   arrange(ENROLID, index_date) |>
   filter(start_cont_enrol <= index_date, end_cont_enrol >= index_date) |> 
   select(ENROLID, index_date, end_cont_enrol)
 
-all_oac_index_ce <- all_oac_index |> 
-  filter(ENROLID %in% ids_with_ce) |>  
+all_neg_con_index_ce <- all_neg_con_index |> 
+  filter(ENROLID %in% ids_with_ce) |>
+  mutate(
+    ENROLID    = as.character(ENROLID),
+    index_date = as.Date(index_date) ) |> 
   left_join(b, by = c("ENROLID", "index_date"))
 
 # Save dataset so you don't have to recompute
-write_parquet(all_oac_index_ce, "C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/all_oac_index_ce.parquet")
+write_parquet(all_neg_con_index_ce, file.path(proj_root, "data", "control", "all_neg_con_index_ce.parquet"))
 
 # Reopen if needed
-all_oac_index_ce <- read_parquet("C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/all_oac_index_ce.parquet")
+# all_neg_con_index_ce <- read_parquet(file.path(proj_root, "data", "control", "all_neg_con_index_ce.parquet"))
 
 
 ```
 
-# Apply continuous exposure rules
 
+# Apply continuous exposure - data.table
 ```{r}
-# ---- Continuous exposure censor (switch or discontinuation) ----
-cont_exposure <- all_oac_index_ce |>
-  arrange(ENROLID, episode_number, SVCDATE) |>
-  group_by(ENROLID, episode_number) |>
-  mutate(
-    exhaustion_date         = SVCDATE + DAYSUPP - 1,            # inclusive days supply
-    grace_days              = round(pmin(DAYSUPP * 0.3, 30)),
-    next_prescription_date  = lead(SVCDATE),
-    next_prescription_drug  = lead(GENNME),
-    adherence_status = case_when(
-      !is.na(next_prescription_date) &
-        next_prescription_date <= exhaustion_date + grace_days &
-        next_prescription_drug == index_med                     ~ "Adherent",
-      !is.na(next_prescription_date) &
-        next_prescription_drug != index_med                     ~ "Switched",
-      TRUE                                                      ~ "Discontinued"
-    ),
-    end_date = case_when(
-      adherence_status == "Adherent"     ~ as.Date(NA),                       # keep going
-      adherence_status == "Switched"     ~ next_prescription_date - 1L,            # stop at switch
-      adherence_status == "Discontinued" ~ exhaustion_date + grace_days       # stop at gap end
-    )
-  ) |>
-  # Summarise to the FIRST time exposure must end in the episode
-  summarise(
+
+# Start from your big dataset
+dt <- as.data.table(all_neg_con_index_ce)
+
+# Ensure dates are base Date (not IDate) to play nice with arithmetic
+# (If they are already Date, this is harmless)
+dt[, SVCDATE := as.Date(SVCDATE)]
+
+# Order like arrange()
+setorder(dt, ENROLID, episode_number, SVCDATE)
+
+# By episode
+dt[, `:=`(
+  exhaustion_date        = SVCDATE + DAYSUPP - 1L,                      # inclusive days supply
+  grace_days             = pmin(round(DAYSUPP * 0.3), 30L),             # cap at 30
+  next_prescription_date = shift(SVCDATE, type = "lead"),               # like lead()
+  next_prescription_drug = shift(GENNME, type = "lead")                 # like lead()
+), by = .(ENROLID, episode_number)]
+
+# adherence_status
+dt[, adherence_status := fifelse(
+  !is.na(next_prescription_date) &
+    next_prescription_date <= (exhaustion_date + grace_days) &
+    next_prescription_drug == index_med,
+  "Adherent",
+  fifelse(
+    !is.na(next_prescription_date) & next_prescription_drug != index_med,
+    "Switched",
+    "Discontinued"
+  )
+)]
+
+# end_date
+dt[, end_date := fifelse(
+  adherence_status == "Adherent",
+  as.Date(NA_real_),                                # keep going
+  fifelse(
+    adherence_status == "Switched",
+    next_prescription_date - 1L,                    # stop at switch
+    exhaustion_date + grace_days                    # stop at gap end
+  )
+)]
+
+cont_exposure <- dt[
+  , .(
     discontinuation_or_switch_date = {
       x <- end_date[!is.na(end_date)]
-      if (length(x) == 0L) as.Date(NA) else min(x)
-    },
-    .groups = "drop"
-  )
+      if (length(x) == 0L) as.Date(NA_real_) else min(x)
+    }
+  ),
+  by = .(ENROLID, episode_number)
+]
+
+dt[, c("exhaustion_date", "grace_days",
+       "next_prescription_date", "next_prescription_drug",
+       "adherence_status", "end_date") := NULL]
 
 # ---- Merge back; cap follow-up by enrollment and study end ----
+
+# Start from your main dataset
+dt_index <- as.data.table(all_neg_con_index_ce)
+ce_dt    <- as.data.table(cont_exposure)
+
+# Make sure key types are consistent
+dt_index[, ENROLID := as.character(ENROLID)]
+ce_dt[,  ENROLID := as.character(ENROLID)]
+
+# (If needed) ensure dates are base Date
+dt_index[, `:=`(
+  index_date    = as.Date(index_date),
+  end_cont_enrol = as.Date(end_cont_enrol)  # if it exists / is used later
+)]
+ce_dt[, discontinuation_or_switch_date := as.Date(discontinuation_or_switch_date)]
+
+# Key the tables for fast join
+setkey(dt_index, ENROLID, episode_number)
+setkey(ce_dt,    ENROLID, episode_number)
+
+# Fast join: bring discontinuation_or_switch_date onto dt_index
+dt_index[ce_dt, discontinuation_or_switch_date := i.discontinuation_or_switch_date]
+
 study_end <- as.Date("2021-12-31")
 
-all_oac_index_ce_cont_exp <- all_oac_index_ce |>
-  left_join(cont_exposure, by = c("ENROLID", "episode_number")) |>
-  group_by(ENROLID, episode_number) |>
-  mutate(
-    obj_period_end = pmin(
-      coalesce(end_cont_enrol, study_end),
-      coalesce(discontinuation_or_switch_date, study_end),
-      study_end,
-      na.rm = TRUE
-    ), 
-    follow_up_days = as.integer(obj_period_end - index_date + 1L)
-  ) |>
-  ungroup() |>
-  filter(follow_up_days > 0)
+dt_index[, obj_period_end := {
+  # Replace NA with study_end, then take min (cap at study_end)
+  end_cont   <- fifelse(is.na(end_cont_enrol),           study_end, end_cont_enrol)
+  disc_or_sw <- fifelse(is.na(discontinuation_or_switch_date), study_end, discontinuation_or_switch_date)
+  pmin(end_cont, disc_or_sw, study_end, na.rm = TRUE)
+}]
 
-oac_cohort <- all_oac_index_ce_cont_exp |>
-  distinct(ENROLID, episode_number, index_med, index_date, age_at_index, obj_period_end, follow_up_days)
+dt_index[, follow_up_days := as.integer(obj_period_end - index_date + 1L)]
 
-# Persist & reload if desired
-write_parquet(oac_cohort, "C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/oac_cohort.parquet")
-oac_cohort <- read_parquet("C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/oac_cohort.parquet")
+# Filter follow-up > 0
+dt_index <- dt_index[follow_up_days > 0]
+
+# Distinct by selected columns
+neg_con_cohort <- unique(
+  dt_index[, .(
+    ENROLID,
+    episode_number,
+    index_med,
+    index_date,
+    age_at_index,
+    obj_period_end,
+    follow_up_days
+  )]
+)
+
+write_parquet(
+  neg_con_cohort,
+  file.path(proj_root, "data", "control", "neg_con_cohort.parquet")
+)
+
+# neg_con_cohort <- read_parquet(file.path(proj_root, "data", "control", "neg_con_cohort.parquet"))
 
 # IDs to use downstream
-oac_user_ids <- unique(oac_cohort$ENROLID)
+neg_con_user_ids <- unique(neg_con_cohort$ENROLID)
 
 ```
 
@@ -718,12 +752,12 @@ identify_bleed_outcome <- function(dataset_path_s, dataset_path_i, dataset_path_
   all_comb_sec_pattern_icd10 <- paste(all_comb_sec_icd10, collapse = "|")
   
   # (Assume trauma_hcpcs_all and trauma_check_icd9/trauma_check_icd10, etc. are defined externally)
-  
+  neg_con_user_ids <- as.numeric(neg_con_user_ids)
   # =========================================================================
   # 1. LOAD TRANSFUSION DATA 
   transfusion_data <- open_dataset(dataset_path_s) %>%
     select(ENROLID, YEAR, ADMDATE, DISDATE, REVCODE) %>%
-    filter(ENROLID %in% oac_user_ids) %>%
+    filter(ENROLID %in% neg_con_user_ids) %>%
     collect() %>%
     mutate(REVCODE3 = substr(REVCODE, 1, 3)) %>%
     filter(REVCODE3 %in% c("038","039")) %>%
@@ -735,7 +769,7 @@ identify_bleed_outcome <- function(dataset_path_s, dataset_path_i, dataset_path_
   # 2. LOAD INPATIENT DATA & MERGE TRANSFUSION INFO
   inpatient_data <- open_dataset(dataset_path_i, unify_schemas = TRUE) %>%
     select(ENROLID, YEAR, ADMDATE, AGE, DAYS, DISDATE, DXVER, PDX, DX1:DX15, PROC1:PROC15) %>%
-    filter(ENROLID %in% oac_user_ids) %>%
+    filter(ENROLID %in% neg_con_user_ids) %>%
     collect() %>%
     left_join(transfusion_data, by = c("ENROLID", "YEAR", "ADMDATE", "DISDATE")) %>%
     mutate(PDX = coalesce(PDX, DX1)) |> 
@@ -934,14 +968,14 @@ ccae_bleed_outcome_no_trauma <- identify_bleed_outcome(
   dataset_path_s = "//pharm-c-psop/TruvenData/Truven Data R/ccae/s",
   dataset_path_i = "//pharm-c-psop/TruvenData/Truven Data R/ccae/i",
   dataset_path_o = "//pharm-c-psop/TruvenData/Truven Data R/ccae/o",
-  output_path_event = "C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/ccae_bleed_outcome_no_trauma.parquet"
+  output_path_event = "C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/control/ccae_bleed_outcome_no_trauma.parquet"
 )
 
 mdcr_bleed_outcome_no_trauma <- identify_bleed_outcome(
   dataset_path_s = "//pharm-c-psop/TruvenData/Truven Data R/mdcr/s",
   dataset_path_i = "//pharm-c-psop/TruvenData/Truven Data R/mdcr/i",
   dataset_path_o = "//pharm-c-psop/TruvenData/Truven Data R/mdcr/o",
-  output_path_event = "C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/mdcr_bleed_outcome_no_trauma.parquet"
+  output_path_event = "C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/control/mdcr_bleed_outcome_no_trauma.parquet"
 )
 
 # =============================================================================
@@ -956,13 +990,13 @@ all_outcome <- bind_rows(ccae_bleed_outcome_no_trauma, mdcr_bleed_outcome_no_tra
   mutate(eventnum = row_number()) %>%
   select(ENROLID, ADMDATE, DAYS, DISDATE, hospnum, eventnum, bleed_site)
 
-all_outcome |> write_parquet("C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/all_inpatient_bleed_no_trauma.parquet")
+all_outcome |> write_parquet("C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/control/all_inpatient_bleed_no_trauma.parquet")
 
 # Read in datasets if needed
 # ccae_bleed_outcome_no_trauma <- read_parquet("C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/ccae_bleed_outcome_no_trauma.parquet")
 # mdcr_bleed_outcome_no_trauma <- read_parquet("C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/mdcr_bleed_outcome_no_trauma.parquet")
 
-all_inpatient_bleed_no_trauma <- read_parquet("C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/all_inpatient_bleed_no_trauma.parquet")
+all_inpatient_bleed_no_trauma <- read_parquet("C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/control/all_inpatient_bleed_no_trauma.parquet")
 
 outcome_vec <- unique(all_inpatient_bleed_no_trauma$ENROLID)
 
@@ -1033,8 +1067,12 @@ outcome_vec <- unique(events_collapsed$ENROLID)
 # Create analytic cohort
 
 ```{r}
-analytic_cohort_oac <- oac_cohort %>%
+events_collapsed <- events_collapsed |> 
+  mutate(ENROLID = as.character(ENROLID))
+
+analytic_cohort_neg_con <- neg_con_cohort %>%
   select(ENROLID, episode_number, index_med, index_date, age_at_index, obj_period_end) %>%
+  mutate(ENROLID = as.character(ENROLID)) |> 
   inner_join(events_collapsed, by = "ENROLID") %>%
   group_by(ENROLID) |> # not grouping by episode number so that prior events for same patient who indexes twice (or more) are captured
   mutate(pre_index_event = as.integer(any(bleed_adm_date < index_date))) |> 
@@ -1056,10 +1094,10 @@ analytic_cohort_oac <- oac_cohort %>%
     object = index_med
   ) 
 
-analytic_cohort_oac <- analytic_cohort_oac |>
-  mutate(object = canon_oac(object))
+analytic_cohort_neg_con <- analytic_cohort_neg_con |>
+  mutate(object = canon_drug(object))
 
-# analytic_cohort_oac_2 <- analytic_cohort_oac |> 
+# analytic_cohort_neg_con_2 <- analytic_cohort_neg_con |> 
 #   # group_by(ENROLID) |> 
 #   # filter(episode_number == min(episode_number)) |>  #only allows for minimum episode number for each person (no re-entry)
 #   # ungroup() |> 
@@ -1073,11 +1111,11 @@ analytic_cohort_oac <- analytic_cohort_oac |>
 #     TRUE ~ "Other"
 #   ))
 
-cohort_ids <- unique(analytic_cohort_oac$ENROLID)
+cohort_ids <- unique(analytic_cohort_neg_con$ENROLID)
 
-write_rds(analytic_cohort_oac, "C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/analytic_cohort_oac.rds")
+write_rds(analytic_cohort_neg_con, "C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/control/analytic_cohort_neg_con.rds")
 
-analytic_cohort_oac <- read_rds("C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/analytic_cohort_oac.rds")
+analytic_cohort_neg_con <- read_rds("C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/control/analytic_cohort_neg_con.rds")
 
 ```
 
@@ -1608,19 +1646,19 @@ gtsave(pub_table, "table1.html")
 ```{r}
 # Generate outcome datasets for each object -------------------------------
 
-create_oac_dataset_for_loop_outcome <- function(oac) {
-    target <- canon_oac(oac)
-  analytic_cohort_oac_filtered <- analytic_cohort_oac %>%
-    mutate(object = canon_oac(object)) %>%
+create_neg_con_dataset_for_loop_outcome <- function(drug) {
+    target <- canon_drug(drug)
+  analytic_cohort_neg_con_filtered <- analytic_cohort_neg_con %>%
+    mutate(object = canon_drug(object)) %>%
     filter(object == target)
 
-  if (nrow(analytic_cohort_oac_filtered) == 0L) {
-    message("No rows for object matching pattern: ", oac)
+  if (nrow(analytic_cohort_neg_con_filtered) == 0L) {
+    message("No rows for object matching pattern: ", drug)
     return(tibble(ENROLID = integer(), episode_number = integer()))
   }
   
     # one row per ENROLID-episode with episode-level metadata
-  dataset_for_loop <- analytic_cohort_oac_filtered %>%
+  dataset_for_loop <- analytic_cohort_neg_con_filtered %>%
     arrange(ENROLID, episode_number, index_date, bleed_adm_date) %>%             # deterministic
     distinct(ENROLID, episode_number, .keep_all = TRUE) %>%               # keep first per episode
     select(
@@ -1631,7 +1669,7 @@ create_oac_dataset_for_loop_outcome <- function(oac) {
 
 
   # event-day layout (wide), one row per ENROLID-episode
-  dataset_for_loop_outcome <- analytic_cohort_oac_filtered %>%
+  dataset_for_loop_outcome <- analytic_cohort_neg_con_filtered %>%
     arrange(ENROLID, episode_number, day_of_event, bleed_adm_date) %>%
     mutate(
       day_of_event = as.integer(day_of_event),
@@ -1653,21 +1691,13 @@ create_oac_dataset_for_loop_outcome <- function(oac) {
 }
 
 # If your analytic_cohort_oac_2$object still uses long names, call with these:
-outcome_loops_apixaban    <- create_oac_dataset_for_loop_outcome("Apixaban")
-outcome_loops_rivaroxaban <- create_oac_dataset_for_loop_outcome("Rivaroxaban")
-outcome_loops_dabigatran  <- create_oac_dataset_for_loop_outcome("Dabigatran")
-outcome_loops_warfarin    <- create_oac_dataset_for_loop_outcome("Warfarin")
+outcome_loops_neg_con  <- create_neg_con_dataset_for_loop_outcome("Lisinopril")
 
 # Pull each cohort from the lists
-dataset_for_loop_apixaban           <- outcome_loops_apixaban$dataset_for_loop
-dataset_for_loop_rivaroxaban        <- outcome_loops_rivaroxaban$dataset_for_loop
-dataset_for_loop_dabigatran         <- outcome_loops_dabigatran$dataset_for_loop
-dataset_for_loop_warfarin           <- outcome_loops_warfarin$dataset_for_loop
+dataset_for_loop_neg_con          <- outcome_loops_neg_con$dataset_for_loop
 
-dataset_for_loop_outcome_apixaban   <- outcome_loops_apixaban$dataset_for_loop_outcome
-dataset_for_loop_outcome_rivaroxaban<- outcome_loops_rivaroxaban$dataset_for_loop_outcome
-dataset_for_loop_outcome_dabigatran <- outcome_loops_dabigatran$dataset_for_loop_outcome
-dataset_for_loop_outcome_warfarin   <- outcome_loops_warfarin$dataset_for_loop_outcome
+dataset_for_loop_outcome_neg_con   <- outcome_loops_neg_con$dataset_for_loop_outcome
+
 
 ```
 
@@ -1704,39 +1734,72 @@ compute_daysupp <- function(svcdate, daysupp) {
 
 
 # Define function to collect this for each OAC
-oac_precipitant_processing <- function(oac){
+drug_precipitant_processing <- function(drug){
 
   # Canonicalize the requested OAC up front
-  target <- canon_oac(oac)
+  target <- canon_drug(drug)
 
   # 1) Select object drug to analyze
-  precipitant_cohort <- analytic_cohort_oac |>
-    mutate(object = canon_oac(object)) |>
+  precipitant_cohort <- analytic_cohort_neg_con |>
+    mutate(object = canon_drug(object)) |>
     filter(object == target) |>
     arrange(ENROLID, index_date) |>
     distinct(ENROLID, index_date, .keep_all = TRUE) |>
     select(ENROLID, object, index_date, obj_period_end, day_obs_start, day_obs_end, episode_number)
 
   # 2) Pare down all_drug_full for only ids above
-  oac_specific_precipitants <- all_drug_full |>
+  neg_con_specific_precipitants <- all_drug_full |>
     filter(ENROLID %in% precipitant_cohort$ENROLID) |>
     filter(!is.na(GENNME), GENNME != "")
 
-  # 3) Join and limit to drugs used during the object window
-  #    Build a case-insensitive pattern for all DOACs to exclude them:
-  oac_re <- paste0("(?i)\\b(", paste(oac_drug_list, collapse = "|"), ")\\b")
-
-  precipitant_cohort_2 <- precipitant_cohort |>
-    left_join(oac_specific_precipitants, by = "ENROLID") |>
+  # 3) Join and limit to drugs used during the object window; compute precip window
+  joined <- precipitant_cohort |>
+    left_join(neg_con_specific_precipitants, by = "ENROLID") |>
     arrange(ENROLID, SVCDATE) |>
     mutate(
       precip_start = SVCDATE,
       precip_end   = compute_daysupp(SVCDATE, DAYSUPP)
     ) |>
-    filter(precip_start <= obj_period_end & precip_end >= index_date) |>
-    mutate(doac = str_detect(GENNME, oac_re)) |>
-    filter(doac == FALSE) |>
-    select(-doac)
+    filter(precip_start <= obj_period_end & precip_end >= index_date)
+
+  # 3a) Build OAC exposure spans (for censoring NC days later)
+  # oac_generic should be a vector of your OAC names, e.g.:
+  # oac_generic <- c("Apixaban","Rivaroxaban","Dabigatran","Edoxaban","Warfarin")
+  oac_re <- paste0("(?i)\\b(", paste(oac_generic, collapse = "|"), ")\\b")
+
+  oac_spans_tmp <- joined |>
+    mutate(
+      is_oac = str_detect(GENNME, oac_re)
+    ) |>
+    filter(is_oac) |>
+    transmute(
+      ENROLID,
+      episode_number,
+      # spans on calendar scale
+      oac_start_date = precip_start,
+      oac_end_date   = precip_end,
+      # same day scale you use elsewhere: days since lisinopril index
+      oac_day_start  = as.numeric(oac_start_date - index_date),
+      oac_day_end    = as.numeric(oac_end_date   - index_date)
+    ) |>
+    filter(oac_day_start <= oac_day_end)
+
+  # Accumulate across calls (in case you later run per-OAC NCs)
+  if (!exists("oac_spans_negcon", inherits = TRUE)) {
+    oac_spans_negcon <<- oac_spans_tmp
+  } else {
+    oac_spans_negcon <<- bind_rows(oac_spans_negcon, oac_spans_tmp)
+  }
+
+  # 3b) Now drop DOACs/warfarin etc as precipitants for the NC analysis
+  neg_con_re <- paste0("(?i)\\b(", paste(neg_control, collapse = "|"), ")\\b")
+
+  precipitant_cohort_2 <- joined |>
+    mutate(neg_con = str_detect(GENNME, neg_con_re)) |>
+    filter(neg_con == FALSE) |>
+    select(-neg_con)
+
+
 
   # 4) Exclusions (guard against NAs)
   precipitant_cohort_3 <- precipitant_cohort_2 |>
@@ -1754,7 +1817,7 @@ oac_precipitant_processing <- function(oac){
 
   # 5) Pull out individual drugs; split combo products
   precipitant_active_ingredients <- precipitant_cohort_3 |>
-    tidyr::separate_rows(GENNME, sep = "[:/;]") |>
+    separate_rows(GENNME, sep = "[:/;]") |>
     mutate(GENNME = str_trim(GENNME)) |>
     filter(GENNME != "") |>
     select(ENROLID, index_date, GENNME)
@@ -1826,29 +1889,23 @@ oac_precipitant_processing <- function(oac){
 
 
 # Initialize a list to store the results for each OAC
-oac_results <- list()
+neg_con_results <- list()
 
 # Run the function for each OAC and store both the cohort and the vector
-oac_results$apixaban <- oac_precipitant_processing("Apixaban")
-oac_results$rivaroxaban <- oac_precipitant_processing("Rivaroxaban")
-oac_results$dabigatran <- oac_precipitant_processing("Dabigatran")
-oac_results$warfarin <- oac_precipitant_processing("Warfarin")
+neg_con_results$lisinopril <- drug_precipitant_processing("Lisinopril")
 
 #Pull each cohort from the list
 # Access the cohort for Apixaban
-apixaban_cohort <- oac_results$apixaban$cohort
-rivaroxaban_cohort <- oac_results$rivaroxaban$cohort
-dabigatran_cohort <- oac_results$dabigatran$cohort
-warfarin_cohort <- oac_results$warfarin$cohort
-
+neg_con_cohort <- neg_con_results$lisinopril$cohort
 # Access the precipitant vector for each
-apixaban_vector <- oac_results$apixaban$vector
-rivaroxaban_vector <- oac_results$rivaroxaban$vector
-dabigatran_vector <- oac_results$dabigatran$vector
-warfarin_vector <- oac_results$warfarin$vector
+neg_con_vector <- neg_con_results$lisinopril$vector
 
-# warfarin_vector
-# write.csv(warfarin_vector, "sorted_drugs.csv", row.names = FALSE)
+
+# Save OAC spans used to drop OAC days in NC analysis
+saveRDS(
+  oac_spans_negcon,
+  file.path(proj_root, "data/control/loop_datasets/oac_spans_negcon.rds")
+)
 ```
 
 ```{r}
@@ -1857,68 +1914,36 @@ warfarin_vector <- oac_results$warfarin$vector
 # ===============================
 
 
-# Apixaban
-write_rds(dataset_for_loop_apixaban, file.path(proj_root, "/data/loop_datasets/dataset_for_loop_apixaban.rds"))
-write_rds(dataset_for_loop_outcome_apixaban, file.path(proj_root, "/data/loop_datasets/dataset_for_loop_outcome_apixaban.rds"))
-write_rds(apixaban_cohort, file.path(proj_root, "/data/loop_datasets/apixaban_cohort.rds"))
-write_rds(apixaban_vector, file.path(proj_root, "/data/loop_datasets/apixaban_vector.rds"))
-
-# Rivaroxaban
-write_rds(dataset_for_loop_rivaroxaban, file.path(proj_root, "/data/loop_datasets/dataset_for_loop_rivaroxaban.rds"))
-write_rds(dataset_for_loop_outcome_rivaroxaban, file.path(proj_root, "/data/loop_datasets/dataset_for_loop_outcome_rivaroxaban.rds"))
-write_rds(rivaroxaban_cohort, file.path(proj_root, "/data/loop_datasets/rivaroxaban_cohort.rds"))
-write_rds(rivaroxaban_vector, file.path(proj_root, "/data/loop_datasets/rivaroxaban_vector.rds"))
-
-# Dabigatran
-write_rds(dataset_for_loop_dabigatran, file.path(proj_root, "/data/loop_datasets/dataset_for_loop_dabigatran.rds"))
-write_rds(dataset_for_loop_outcome_dabigatran, file.path(proj_root, "/data/loop_datasets/dataset_for_loop_outcome_dabigatran.rds"))
-write_rds(dabigatran_cohort, file.path(proj_root, "/data/loop_datasets/dabigatran_cohort.rds"))
-write_rds(dabigatran_vector, file.path(proj_root, "/data/loop_datasets/dabigatran_vector.rds"))
-
-# Warfarin
-write_rds(dataset_for_loop_warfarin, file.path(proj_root, "/data/loop_datasets/dataset_for_loop_warfarin.rds"))
-write_rds(dataset_for_loop_outcome_warfarin, file.path(proj_root, "/data/loop_datasets/dataset_for_loop_outcome_warfarin.rds"))
-write_rds(warfarin_cohort, file.path(proj_root, "/data/loop_datasets/warfarin_cohort.rds"))
-write_rds(warfarin_vector, file.path(proj_root, "/data/loop_datasets/warfarin_vector.rds"))
+# Lisinopril
+write_rds(dataset_for_loop_neg_con, file.path(proj_root, "/data/control/loop_datasets/dataset_for_loop_neg_con.rds"))
+write_rds(dataset_for_loop_outcome_neg_con, file.path(proj_root, "/data/control/loop_datasets/dataset_for_loop_outcome_neg_con.rds"))
+write_rds(neg_con_cohort, file.path(proj_root, "/data/control/loop_datasets/neg_con_cohort.rds"))
+write_rds(neg_con_vector, file.path(proj_root, "/data/control/loop_datasets/neg_con_vector.rds"))
 
 
 # ===============================
 # Reload datasets (if needed)
 # ===============================
 
-# Apixaban
-dataset_for_loop_apixaban         <- read_rds(file.path(proj_root, "data/loop_datasets/dataset_for_loop_apixaban.rds"))
-dataset_for_loop_outcome_apixaban <- read_rds(file.path(proj_root, "data/loop_datasets/dataset_for_loop_outcome_apixaban.rds"))
-apixaban_cohort                   <- read_rds(file.path(proj_root, "data/loop_datasets/apixaban_cohort.rds"))
-apixaban_vector                   <- read_rds(file.path(proj_root, "data/loop_datasets/apixaban_vector.rds"))
+# Negative Control
+dataset_for_loop_neg_con         <- read_rds(file.path(proj_root, "/data/control/loop_datasets/dataset_for_loop_neg_con.rds"))
+dataset_for_loop_outcome_neg_con <- read_rds(file.path(proj_root, "/data/control/loop_datasets/dataset_for_loop_outcome_neg_con.rds"))
+neg_con_cohort                   <- read_rds(file.path(proj_root, "/data/control/loop_datasets/neg_con_cohort.rds"))
+neg_con_vector                   <- read_rds(file.path(proj_root, "/data/control/loop_datasets/neg_con_vector.rds"))
+oac_spans_negcon                 <- readRDS(file.path(proj_root, "data/control/loop_datasets/oac_spans_negcon.rds")) # Need to load to drop OAC days
 
-# Rivaroxaban
-dataset_for_loop_rivaroxaban         <- read_rds(file.path(proj_root, "data/loop_datasets/dataset_for_loop_rivaroxaban.rds"))
-dataset_for_loop_outcome_rivaroxaban <- read_rds(file.path(proj_root, "data/loop_datasets/dataset_for_loop_outcome_rivaroxaban.rds"))
-rivaroxaban_cohort                   <- read_rds(file.path(proj_root, "data/loop_datasets/rivaroxaban_cohort.rds"))
-rivaroxaban_vector                   <- read_rds(file.path(proj_root, "data/loop_datasets/rivaroxaban_vector.rds"))
-
-# Dabigatran
-dataset_for_loop_dabigatran         <- read_rds(file.path(proj_root, "data/loop_datasets/dataset_for_loop_dabigatran.rds"))
-dataset_for_loop_outcome_dabigatran <- read_rds(file.path(proj_root, "data/loop_datasets/dataset_for_loop_outcome_dabigatran.rds"))
-dabigatran_cohort                   <- read_rds(file.path(proj_root, "data/loop_datasets/dabigatran_cohort.rds"))
-dabigatran_vector                   <- read_rds(file.path(proj_root, "data/loop_datasets/dabigatran_vector.rds"))
-
-# Warfarin
-dataset_for_loop_warfarin         <- read_rds(file.path(proj_root, "data/loop_datasets/dataset_for_loop_warfarin.rds"))
-dataset_for_loop_outcome_warfarin <- read_rds(file.path(proj_root, "data/loop_datasets/dataset_for_loop_outcome_warfarin.rds"))
-warfarin_cohort                   <- read_rds(file.path(proj_root, "data/loop_datasets/warfarin_cohort.rds"))
-warfarin_vector                   <- read_rds(file.path(proj_root, "data/loop_datasets/warfarin_vector.rds"))
 
 
 ```
 
-# Run SCCS Loop
+# Run SCCS Loop - Lisinopril
 
 ```{r}
 ### 10/24/25 Chat GPT gave this which has toggles for adjustment. no idea if it works...### unadjusted check. adjust_30 changed to true. check apap to see if same.10/25 - unadjusted toggle and adjusted toggle both work (APAP unchanged) - need to test an antiplatelet to see if unchanged since or maybe some other med...could just look to see if change from previous results to these results...can run unadjusted and save, then run adjusted and save and compare...
 
 #10/29 - didn't do above because the estimates look reasonable. will need to shrink them and see how many hits I have remaining...17 significant shrunk results before...we will see if this changes. need to be able to save after I run the loop so I don't lose everything when my computer inevitably crashes again. Need to repeat with lisinopril as well. also, need to review loop line by line and comment out what is happening...
+
+# 11/19 - built in functionality to drop oac-exposed days.
 
 # ===========================
 # SCCS loop — Poisson FE primary (with 30d-covariate toggle)
@@ -2021,7 +2046,8 @@ add_30d_OLDBIN <- function(dt,
 build_panel <- function(object_data, object_cohort, outcome_dataset,
                         drug_label,
                         match_mode = c("substring","exact","broad"),
-                        include_washout = TRUE, washout_days = 7L) {
+                        include_washout = TRUE, washout_days = 7L,
+                        exclude_oac_days = TRUE) {
   match_mode <- match.arg(match_mode)
 
   # Base daily panel per episode
@@ -2032,6 +2058,20 @@ build_panel <- function(object_data, object_cohort, outcome_dataset,
 
   pd <- as.data.table(object_cohort)
 
+    # ---- NEW: drop days where patient is on an OAC (for lisinopril NC) ----
+  if (isTRUE(exclude_oac_days) && exists("oac_spans_negcon", inherits = TRUE)) {
+    oac_dt <- as.data.table(oac_spans_negcon)
+    if (nrow(oac_dt)) {
+      base[, oac_exposed := 0L]
+      base[oac_dt,
+           on = .(ENROLID, episode_number,
+                  day >= oac_day_start,
+                  day <= oac_day_end),
+           oac_exposed := 1L]
+      base <- base[oac_exposed == 0L][, oac_exposed := NULL]
+    }
+  }
+  
   # Exposure rows by match mode
   expos <- switch(match_mode,
     exact = pd[tolower(precipitant) == tolower(drug_label)],
@@ -2106,8 +2146,15 @@ fit_cell <- function(object_name, object_data, object_cohort, outcome_data,
                      match_mode = c("substring","exact","broad"),
                      include_washout = TRUE, washout_days = 7L) {
   match_mode <- match.arg(match_mode)
-  panel <- build_panel(object_data, object_cohort, outcome_data,
-                       drug_label, match_mode, include_washout, washout_days)
+  
+panel <- build_panel(
+  object_data, object_cohort, outcome_data,
+  drug_label,
+  match_mode       = match_mode,
+  include_washout  = include_washout,
+  washout_days     = washout_days,
+  exclude_oac_days = TRUE   # NC: drop OAC days
+)
 
   # SCCS conditioning: keep only strata with ≥1 event
   df <- panel[, has_event := any(event == 1L), by = unique_id][has_event == TRUE][]
@@ -2219,10 +2266,7 @@ fit_cell <- function(object_name, object_data, object_cohort, outcome_data,
 # ------------ Driver over all objects ------------
 # Expect: dataset_for_loop_*, *_cohort (precipitant_cohort_refined), *_outcome, and *_vector present
 objs <- list(
-  list(name="Apixaban",    data=dataset_for_loop_apixaban,    cohort=apixaban_cohort,    outcome=dataset_for_loop_outcome_apixaban,    vector=if (USE_TEST_VECTOR) test_vector else apixaban_vector),
-  list(name="Rivaroxaban", data=dataset_for_loop_rivaroxaban, cohort=rivaroxaban_cohort, outcome=dataset_for_loop_outcome_rivaroxaban, vector=if (USE_TEST_VECTOR) test_vector else rivaroxaban_vector),
-  list(name="Dabigatran",  data=dataset_for_loop_dabigatran,  cohort=dabigatran_cohort,  outcome=dataset_for_loop_outcome_dabigatran,  vector=if (USE_TEST_VECTOR) test_vector else dabigatran_vector),
-  list(name="Warfarin",    data=dataset_for_loop_warfarin,    cohort=warfarin_cohort,    outcome=dataset_for_loop_outcome_warfarin,   vector=if (USE_TEST_VECTOR) test_vector else warfarin_vector)
+  list(name="Lisinopril",    data=dataset_for_loop_neg_con,    cohort=neg_con_cohort,    outcome=dataset_for_loop_outcome_neg_con,    vector=if (USE_TEST_VECTOR) test_vector else neg_con_vector)
 )
 
 run_scan <- function(objs, match_mode="broad", include_washout=TRUE, washout_days=7L) {
@@ -2247,8 +2291,8 @@ run_scan <- function(objs, match_mode="broad", include_washout=TRUE, washout_day
 ADJUST_30DAY <- FALSE
 res_unadj <- run_scan(objs, match_mode = match_mode, include_washout = include_washout, washout_days = washout_days)
 
-data.table::fwrite(res_unadj, file.path(proj_root, "results/sccs_results_unadjusted.csv"))
-saveRDS(res_unadj, file.path(proj_root, "results/sccs_results_unadjusted.rds"))
+data.table::fwrite(res_unadj, file.path(proj_root, "results/control/sccs_results_unadjusted.csv"))
+saveRDS(res_unadj, file.path(proj_root, "results/control/sccs_results_unadjusted.rds"))
 
 rm(res_unadj); gc()   # clear memory
 
@@ -2256,8 +2300,8 @@ rm(res_unadj); gc()   # clear memory
 ADJUST_30DAY <- TRUE
 res_adj <- run_scan(objs, match_mode = match_mode, include_washout = include_washout, washout_days = washout_days)
 
-data.table::fwrite(res_adj, file.path(proj_root, "results/sccs_results_adjusted.csv"))
-saveRDS(res_adj, file.path(proj_root, "results/sccs_results_adjusted.rds"))
+data.table::fwrite(res_adj, file.path(proj_root, "results/control/sccs_results_adjusted.csv"))
+saveRDS(res_adj, file.path(proj_root, "results/control/sccs_results_adjusted.rds"))
 
 rm(res_adj); gc()
 
@@ -2265,4 +2309,269 @@ rm(res_adj); gc()
 # results_filtered <- results[!is.na(p_value) & p_value <= 0.05]
 # print(results_filtered)
 
+# Read unadjusted results
+res_unadj <- readRDS(file.path(proj_root, "results/control/sccs_results_unadjusted.rds"))
+
+# OR (if you prefer CSV)
+# res_unadj <- data.table::fread(file.path(proj_root, "results/control/sccs_results_unadjusted.csv"))
+
+# Read adjusted results
+res_adj <- readRDS(file.path(proj_root, "results/control/sccs_results_adjusted.rds"))
+
+# OR (if you prefer CSV)
+# res_adj <- data.table::fread(file.path(proj_root, "results/control/sccs_results_adjusted.csv"))
+
 ```
+
+#shrink
+
+```{r}
+# =========================================================
+# Semi-Bayes shrinkage exactly per Zhou et al. (fixed prior)
+#   - Primary prior:  Var(log RR) = 0.25  (~7-fold 95% range)
+#   - Secondary:      Var(log RR) = 0.67  (~25-fold 95% range)
+#   - Optional screen: >=5 exposed cases; drop if Var(beta) > 10
+#   - Optional ratio vs Pravastatin using delta method
+# =========================================================
+
+if (!requireNamespace("data.table", quietly=TRUE)) install.packages("data.table")
+suppressPackageStartupMessages({ library(data.table) })
+
+# =========================================================
+# Shrinkage for BOTH unadjusted and adjusted results
+# Saves to file.path(proj_root, "results", "<label>_shrunk_priorXYZ.*")
+# =========================================================
+
+# ensure results dir exists
+dir.create(file.path(proj_root, "results",  "control"), showWarnings = FALSE, recursive = TRUE)
+
+# ---- helper: single shrinkage run + save for a given result table ----
+run_and_save_shrinkage <- function(result_df, label, save_ratios = TRUE) {
+  dt <- data.table::as.data.table(result_df)
+
+  # keep only valid estimates
+  dt <- dt[is.finite(Estimate) & is.finite(SE) & SE > 0]
+  dt[, var_beta := SE^2]
+
+  # Optional filters as in Zhou et al.
+  dt <- dt[var_beta <= 10]
+  if ("n_exposed_cases" %in% names(dt)) {
+    dt <- dt[is.finite(n_exposed_cases) & n_exposed_cases >= 5]
+  }
+
+  # shrinker (fixed prior)
+  shrink_fixed <- function(d, prior_var_log = 0.25, prior_mean_log = 0) {
+    se2  <- d[["SE"]]^2
+    tau2 <- prior_var_log
+    mu0  <- prior_mean_log
+
+    post_prec <- (1/tau2) + (1/se2)
+    post_mean <- ((mu0/tau2) + (d[["Estimate"]]/se2)) / post_prec
+    post_var  <- 1 / post_prec
+    post_se   <- sqrt(post_var)
+
+    d[, `:=`(
+      prior_mean_log = mu0,
+      prior_var_log  = tau2,
+      shrunken_log_rr = post_mean,
+      post_se_log     = post_se,
+      lower_ci_log    = post_mean - 1.96*post_se,
+      upper_ci_log    = post_mean + 1.96*post_se,
+      shrunken_irr    = exp(post_mean),
+      lower_ci        = exp(post_mean - 1.96*post_se),
+      upper_ci        = exp(post_mean + 1.96*post_se),
+      z_shrunk        = post_mean / post_se,
+      p_shrunk        = 2*pnorm(abs(post_mean/post_se), lower.tail = FALSE),
+      sig_any         = (exp(post_mean - 1.96*post_se) > 1 | exp(post_mean + 1.96*post_se) < 1)
+    )]
+    d[]
+  }
+
+  # apply both priors
+  shrunk_025 <- shrink_fixed(data.table::copy(dt), prior_var_log = 0.25)
+  shrunk_067 <- shrink_fixed(data.table::copy(dt), prior_var_log = 0.67)
+
+  # optional ratio vs Pravastatin (uses shrunken values)
+  ratio_vs_prava <- function(d) {
+    if (!("Pravastatin" %in% d$object)) return(NULL)
+    prava <- d[object == "Pravastatin", .(drug, log_rr_p = shrunken_log_rr, var_p = post_se_log^2)]
+    out_list <- lapply(setdiff(unique(d$object), "Pravastatin"), function(obj) {
+      oac <- d[object == obj, .(drug, log_rr_o = shrunken_log_rr, var_o = post_se_log^2)]
+      m <- merge(oac, prava, by = "drug", all = FALSE)
+      if (!nrow(m)) return(NULL)
+      m[, `:=`(
+        object        = obj,
+        log_ratio     = log_rr_o - log_rr_p,
+        var_log_ratio = var_o + var_p,
+        se_log_ratio  = sqrt(var_o + var_p),
+        ratio_rr      = exp(log_rr_o - log_rr_p),
+        ratio_lower   = exp((log_rr_o - log_rr_p) - 1.96*sqrt(var_o + var_p)),
+        ratio_upper   = exp((log_rr_o - log_rr_p) + 1.96*sqrt(var_o + var_p)),
+        ratio_z       = (log_rr_o - log_rr_p) / sqrt(var_o + var_p),
+        ratio_p       = 2*pnorm(abs((log_rr_o - log_rr_p)/sqrt(var_o + var_p)), lower.tail = FALSE),
+        ratio_sig_any = (exp((log_rr_o - log_rr_p) - 1.96*sqrt(var_o + var_p)) > 1 |
+                         exp((log_rr_o - log_rr_p) + 1.96*sqrt(var_o + var_p)) < 1)
+      )][, .(object, drug, ratio_rr, ratio_lower, ratio_upper, ratio_z, ratio_p, ratio_sig_any)]
+    })
+    data.table::rbindlist(out_list, use.names = TRUE, fill = TRUE)
+  }
+
+  keep_cols <- c(
+    "object","drug","method","reason",
+    "Estimate","SE","IRR","Lower95","Upper95","p_value",
+    "prior_mean_log","prior_var_log",
+    "shrunken_log_rr","post_se_log",
+    "shrunken_irr","lower_ci","upper_ci","z_shrunk","p_shrunk","sig_any"
+  )
+
+  save_both <- function(dt2, stem) {
+    out_csv <- file.path(proj_root, "results",  "control", paste0(stem, ".csv"))
+    out_rds <- file.path(proj_root, "results",  "control", paste0(stem, ".rds"))
+    data.table::fwrite(dt2[, intersect(keep_cols, names(dt2)), with = FALSE], out_csv)
+    saveRDS(dt2[, intersect(keep_cols, names(dt2)), with = FALSE], out_rds)
+  }
+
+  # save shrunk tables
+  save_both(shrunk_025, paste0(label, "_shrunk_prior025"))
+  save_both(shrunk_067, paste0(label, "_shrunk_prior067"))
+
+  # quick counts in console
+  quick_counts <- function(x) x[, .(n_all = .N, n_sig = sum(sig_any, na.rm=TRUE)), by = object][order(object)]
+  cat("\n== ", label, " ==\n")
+  print(quick_counts(shrunk_025))
+  print(quick_counts(shrunk_067))
+
+  # optional ratios
+  if (isTRUE(save_ratios)) {
+    r025 <- ratio_vs_prava(shrunk_025)
+    r067 <- ratio_vs_prava(shrunk_067)
+    if (!is.null(r025)) {
+      data.table::fwrite(r025, file.path(proj_root, "results",  "control", paste0("ratio_vs_pravastatin_", label, "_prior025.csv")))
+      saveRDS(r025,              file.path(proj_root, "results",  "control", paste0("ratio_vs_pravastatin_", label, "_prior025.rds")))
+    }
+    if (!is.null(r067)) {
+      data.table::fwrite(r067, file.path(proj_root, "results",  "control", paste0("ratio_vs_pravastatin_", label, "_prior067.csv")))
+      saveRDS(r067,              file.path(proj_root, "results",  "control", paste0("ratio_vs_pravastatin_", label, "_prior067.rds")))
+    }
+  }
+}
+
+# ---- run for both unadjusted and adjusted ----
+if (exists("res_unadj")) run_and_save_shrinkage(res_unadj, "unadjusted", save_ratios = TRUE)
+if (exists("res_adj"))   run_and_save_shrinkage(res_adj,   "adjusted",   save_ratios = TRUE)
+
+cat("\nSemi-Bayes shrinkage complete for available datasets. Files saved under: ",
+    file.path(proj_root, "results",  "control"), "\n")
+```
+
+# Ratio of Ratios
+```{r}
+library(data.table)
+
+# ----------------------------------------------------------
+# Ratio-of-ratios vs Lisinopril using SHRUNKEN log RRs
+#  - Reads OAC shrunk results from:      results/<label>_shrunk_<prior>.rds
+#  - Reads Lisinopril shrunk results from: results/control/<label>_shrunk_<prior>.rds
+#  - Aligns by `drug`
+#  - Computes: RR_OAC / RR_LIS with delta method on shrunken log RR
+#  - Saves to: results/control/ratio_vs_lisinopril_<label>_<prior>.{csv,rds}
+# ----------------------------------------------------------
+# Arguments:
+#   label        : "unadjusted" or "adjusted"
+#   prior_suffix : "prior025" or "prior067"
+#   nc_object    : name of negative-control object in control shrinkage (default "Lisinopril")
+# ----------------------------------------------------------
+
+library(data.table)
+
+compute_ratio_vs_lisinopril <- function(label,
+                                        prior_suffix = "prior025",
+                                        nc_object = "Lisinopril") {
+  # ---- 1) Build file paths ----
+  oac_path <- file.path(proj_root, "results",
+                        paste0(label, "_shrunk_", prior_suffix, ".rds"))
+  nc_path  <- file.path(proj_root, "results", "control",
+                        paste0(label, "_shrunk_", prior_suffix, ".rds"))
+
+  if (!file.exists(oac_path)) stop("OAC shrinkage file not found: ", oac_path)
+  if (!file.exists(nc_path))  stop("Control shrinkage file not found: ", nc_path)
+
+  # ---- 2) Read data ----
+  oac_dt <- as.data.table(readRDS(oac_path))
+  nc_dt  <- as.data.table(readRDS(nc_path))
+
+  # Sanity check columns
+  needed <- c("object", "drug", "shrunken_log_rr", "post_se_log")
+  if (!all(needed %in% names(oac_dt))) stop("OAC table missing needed columns: ", paste(setdiff(needed, names(oac_dt)), collapse = ", "))
+  if (!all(needed %in% names(nc_dt)))  stop("Control table missing needed columns: ", paste(setdiff(needed, names(nc_dt)), collapse = ", "))
+
+  # ---- 3) Get negative-control (Lisinopril) rows by drug ----
+  nc_sub <- nc_dt[object == nc_object,
+                  .(drug,
+                    log_rr_nc = shrunken_log_rr,
+                    var_nc    = post_se_log^2)]
+
+  if (nrow(nc_sub) == 0L) {
+    stop("No rows found for negative-control object '", nc_object,
+         "' in control shrinkage file: ", nc_path)
+  }
+
+  # ---- 4) Loop over each OAC object and compute ratio vs lisinopril ----
+  objects <- sort(unique(oac_dt$object))
+
+  out_list <- lapply(objects, function(obj) {
+    o <- oac_dt[object == obj,
+                .(drug,
+                  log_rr_o = shrunken_log_rr,
+                  var_o    = post_se_log^2)]
+
+    m <- merge(o, nc_sub, by = "drug", all = FALSE)
+    if (!nrow(m)) return(NULL)
+
+    m[, `:=`(
+      object        = obj,
+      log_ratio     = log_rr_o - log_rr_nc,
+      var_log_ratio = var_o + var_nc,
+      se_log_ratio  = sqrt(var_o + var_nc),
+      ratio_rr      = exp(log_rr_o - log_rr_nc),
+      ratio_lower   = exp((log_rr_o - log_rr_nc) - 1.96 * sqrt(var_o + var_nc)),
+      ratio_upper   = exp((log_rr_o - log_rr_nc) + 1.96 * sqrt(var_o + var_nc)),
+      ratio_z       = (log_rr_o - log_rr_nc) / sqrt(var_o + var_nc),
+      ratio_p       = 2 * pnorm(abs((log_rr_o - log_rr_nc) / sqrt(var_o + var_nc)), lower.tail = FALSE),
+      ratio_sig_any = (exp((log_rr_o - log_rr_nc) - 1.96 * sqrt(var_o + var_nc)) > 1 |
+                       exp((log_rr_o - log_rr_nc) + 1.96 * sqrt(var_o + var_nc)) < 1)
+    )]
+
+    m[, .(object, drug,
+          ratio_rr, ratio_lower, ratio_upper,
+          ratio_z, ratio_p, ratio_sig_any)]
+  })
+
+  ratio_dt <- rbindlist(out_list, use.names = TRUE, fill = TRUE)
+  if (!nrow(ratio_dt)) {
+    warning("No overlapping drugs between OAC and Lisinopril results for label=",
+            label, ", prior=", prior_suffix)
+    return(invisible(NULL))
+  }
+
+  # ---- 5) Save output ----
+  stem <- paste0("ratio_vs_lisinopril_", label, "_", prior_suffix)
+  out_csv <- file.path(proj_root, "results", "control", paste0(stem, ".csv"))
+  out_rds <- file.path(proj_root, "results", "control", paste0(stem, ".rds"))
+
+  data.table::fwrite(ratio_dt, out_csv)
+  saveRDS(ratio_dt, out_rds)
+
+  message("Saved ratio-of-ratios vs Lisinopril to:\n  ", out_csv, "\n  ", out_rds)
+  invisible(ratio_dt)
+}
+
+
+ratio_unadj_025 <- compute_ratio_vs_lisinopril("unadjusted", "prior025")
+ratio_unadj_067 <- compute_ratio_vs_lisinopril("unadjusted", "prior067")
+ratio_adj_025   <- compute_ratio_vs_lisinopril("adjusted",   "prior025")
+ratio_adj_067   <- compute_ratio_vs_lisinopril("adjusted",   "prior067")
+
+
+```
+
