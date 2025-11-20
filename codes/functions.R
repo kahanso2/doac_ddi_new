@@ -5,7 +5,8 @@
 extract_drug_name_data <- function(dataset_path, output_path = NULL, enrolid_filter = NULL, ndc_filter = NULL) {
   
   drug_data <- open_dataset(dataset_path) %>% 
-    select(ENROLID, NDCNUM, SVCDATE, YEAR, AGE, DAYSUPP)
+    select(ENROLID, NDCNUM, SVCDATE, YEAR, AGE, DAYSUPP) |> 
+    mutate(ENROLID = as.character(ENROLID))
   
   # Filter by ENROLID if provided.
   if (!is.null(enrolid_filter)) {

@@ -2556,8 +2556,8 @@ compute_ratio_vs_lisinopril <- function(label,
 
   # ---- 5) Save output ----
   stem <- paste0("ratio_vs_lisinopril_", label, "_", prior_suffix)
-  out_csv <- file.path(proj_root, "results", "control", paste0(stem, ".csv"))
-  out_rds <- file.path(proj_root, "results", "control", paste0(stem, ".rds"))
+  out_csv <- file.path(proj_root, "results", "ratio_of_ratios", paste0(stem, ".csv"))
+  out_rds <- file.path(proj_root, "results", "ratio_of_ratios", paste0(stem, ".rds"))
 
   data.table::fwrite(ratio_dt, out_csv)
   saveRDS(ratio_dt, out_rds)
