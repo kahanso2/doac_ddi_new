@@ -1,0 +1,5 @@
+object,n_identified,n_with_rr,n_in_sb,sb_range_irr,n_sig_sb,n_for_ror,ror_range,n_sig_ror,n_potential_ddi
+Apixaban,405,403,367,0.32–2.31,23,22,0.65–2.23,7,3
+Rivaroxaban,421,419,390,0.31–2.82,20,19,0.21–1.91,6,3
+Dabigatran,248,246,222,0.35–3.03,5,4,0.69–1.63,0,0
+Warfarin,536,534,504,0.29–4.10,51,48,0.65–2.84,7,6

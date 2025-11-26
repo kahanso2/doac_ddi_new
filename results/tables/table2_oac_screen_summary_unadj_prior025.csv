@@ -1,0 +1,5 @@
+object,n_precipitants,n_with_estimate,n_sig_shrunk,n_precipitants_sig_oac,n_sig_ror
+Apixaban,367,367,23,23,7
+Dabigatran,222,222,5,5,0
+Rivaroxaban,390,390,20,20,6
+Warfarin,504,504,51,51,7

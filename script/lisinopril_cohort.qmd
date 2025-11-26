@@ -170,50 +170,6 @@ saveRDS(neg_con_ndc, file.path(proj_root, "data","neg_con_ndc.rds"))
 
 ```
 
-# OAC Drug Data
-
-```{r}
-# Use extract_drug_name_data function to pull data for oac cohort (i.e., full oac drug use)
-
-ccaed_oac_2009_2021 <- extract_drug_name_data(
-  dataset_path = "//pharm-c-psop/TruvenData/Truven Data R/ccae/d", 
-  output_path = file.path(proj_root, "data", "ccaed_oac_2009_2021.parquet"), 
-  enrolid_filter = NULL,
-  ndc_filter = oac_ndc
-)
-
-mdcrd_oac_2009_2021 <- extract_drug_name_data(
-  dataset_path = "//pharm-c-psop/TruvenData/Truven Data R/mdcr/d", 
-  output_path = file.path(proj_root, "data", "mdcrd_oac_2009_2021.parquet"), 
-  enrolid_filter = NULL,
-  ndc_filter = oac_ndc)
-
-# Bind drug files from CCAE and MDCR
-all_drug_oac <- bind_rows(ccaed_oac_2009_2021, mdcrd_oac_2009_2021) # 29,015,802 observations
-
-
-# Merge in blank drug names from above
-all_drug_oac_2009_2021 <- all_drug_oac |>
-  filter(!is.na(ENROLID)) |>
-  left_join(id_blank_GENNME_added, by = "NDCNUM") |>
-  mutate(GENNME = if_else(is.na(GENNME), generic_name, GENNME)) |>
-  select(-generic_name) |>
-  mutate(GENNME = canon_drug(GENNME))
-
-
-# Save dataset so don't have to do that again
-all_drug_oac_2009_2021 |> write_parquet(file.path(proj_root, "data", "all_drug_oac_2009_2021.parquet"))
-
-#### CODE TO OPEN DATASET WITHOUT RUNNING ABOVE ####
-
-# Open dataset
-# all_drug_oac_2009_2021 <- read_parquet(file.path(proj_root, "data", "all_drug_oac_2009_2021.parquet"))
-
-# Save unique IDs of oac users
-all_oac_users <- unique(all_drug_oac_2009_2021$ENROLID) # 2,360,604 users
-
-```
-
 # Negative Control Data
 
 ```{r}
@@ -221,14 +177,14 @@ all_oac_users <- unique(all_drug_oac_2009_2021$ENROLID) # 2,360,604 users
 
 ccaed_neg_con_2009_2021 <- extract_drug_name_data(
   dataset_path = "//pharm-c-psop/TruvenData/Truven Data R/ccae/d", 
-  output_path = file.path(proj_root, "data", "ccaed_neg_con_2009_2021.parquet"), 
+  output_path = file.path(proj_root, "data", "control", "ccaed_neg_con_2009_2021.parquet"), 
   enrolid_filter = NULL,
   ndc_filter = neg_con_ndc
 )
 
 mdcrd_neg_con_2009_2021 <- extract_drug_name_data(
   dataset_path = "//pharm-c-psop/TruvenData/Truven Data R/mdcr/d", 
-  output_path = file.path(proj_root, "data", "mdcrd_neg_con_2009_2021.parquet"), 
+  output_path = file.path(proj_root, "data", "control", "mdcrd_neg_con_2009_2021.parquet"), 
   enrolid_filter = NULL,
   ndc_filter = neg_con_ndc)
 
@@ -246,7 +202,7 @@ all_drug_neg_con_2009_2021 <- all_drug_neg_con |>
 
 
 # Save dataset so don't have to do that again
-all_drug_neg_con_2009_2021 |> write_parquet(file.path(proj_root, "data", "all_drug_neg_con_2009_2021.parquet"))
+all_drug_neg_con_2009_2021 |> write_parquet(file.path(proj_root, "data", "control", "all_drug_neg_con_2009_2021.parquet"))
 
 #### CODE TO OPEN DATASET WITHOUT RUNNING ABOVE ####
 
@@ -263,7 +219,7 @@ all_neg_con_users <- unique(all_drug_neg_con_2009_2021$ENROLID) # 10,334,932 use
 # Clean Drug Data
 ```{r}
 # ===========================
-# Drug-data cleaning — data.table (pairwise cancels + nearest future − within 15 days)
+# Drug-data cleaning (pairwise cancels + nearest future − within 15 days)
 # ===========================
 # 1) SAME-DAY cancels: remove +x/−x in PAIRS within (ENROLID, GENNME, SVCDATE, |DAYSUPP|).
 #    If there are extra unmatched fills (e.g., +10,+10 and −10), keep the leftover (+10).
@@ -387,90 +343,90 @@ write_parquet(cleaned_drug_data, file.path(proj_root, "data", "control", "cleane
 # ==========================================================
 
 postclean_assign_rules_dt <- function(df,
-                                      adherence_multiplier,       # adherence proportion in [0,1], e.g., 0.70
-                                      cap = 30L,
-                                      gap_allowed = 30L,
-                                      earliest_index_date = as.IDate("2009-07-01"),
-                                      age_criteria = 18L,
-                                      by_drug = TRUE) {
+                                      adherence_multiplier,        # e.g. 0.70 (70% adherent)
+                                      cap              = 30L,
+                                      gap_allowed      = 183L,      # 183-day “new user” rule
+                                      earliest_index_date = "2009-07-02",
+                                      age_criteria     = 18L) {
 
-  # ---- 0) Coerce to data.table & fast types ----
   dt <- as.data.table(df)
+
+  # ---- Types ----
   if (!inherits(dt$SVCDATE, "IDate")) dt[, SVCDATE := as.IDate(SVCDATE)]
   if (!is.integer(dt$DAYSUPP))        dt[, DAYSUPP := as.integer(DAYSUPP)]
-  if (!"AGE" %in% names(dt))          dt[, AGE := NA_integer_]  # be tolerant if AGE missing
-  if (!is.integer(cap))               cap <- as.integer(cap)
-  if (!is.integer(gap_allowed))       gap_allowed <- as.integer(gap_allowed)
-  if (!inherits(earliest_index_date, "IDate")) earliest_index_date <- as.IDate(earliest_index_date)
+  if (!"AGE" %in% names(dt))          dt[, AGE := NA_integer_]
 
-  # Validate adherence arg (intend proportion)
+  if (!is.integer(cap))          cap          <- as.integer(cap)
+  if (!is.integer(gap_allowed))  gap_allowed  <- as.integer(gap_allowed)
+  earliest_index_date <- as.IDate(earliest_index_date)
+
+  # Sanity check for adherence
   if (is.na(adherence_multiplier) || adherence_multiplier < 0 || adherence_multiplier > 1) {
     stop("adherence_multiplier should be an adherence proportion in [0,1], e.g., 0.70")
   }
 
-  # Keep things deterministically ordered for "first" / fills
-  setorder(dt, ENROLID, GENNME, SVCDATE)
+  # Make ordering deterministic
+  setorder(dt, ENROLID, SVCDATE, GENNME)
 
-  # ---- 1) calculate_drug_end_plus_grace ----
-  # grace = (1 - adherence) * DAYSUPP, capped by `cap` (cap applies to grace only)
+  # ---- 1) drug_end_plus_grace ----
+  # grace ≈ (1 - adherence) * DAYSUPP, capped by `cap`
   dt[, grace_raw  := as.integer(round(DAYSUPP * (1 - adherence_multiplier)))]
   dt[, grace_days := pmin(grace_raw, cap)]
+  dt[, grace_raw  := NULL]
+
   dt[, drug_end_plus_grace := SVCDATE + (DAYSUPP - 1L) + grace_days]
-  dt[, grace_raw := NULL]
 
-  # ---- 2) flag_gaps_and_assign_episodes ----
-  # Grouping level: per-drug (default) or any-drug
-  grp <- if (isTRUE(by_drug)) c("ENROLID", "GENNME") else c("ENROLID")
+  # ---- 2) flag_gaps_and_assign_episodes (PERSON-level) ----
+  # Episodes are per ENROLID across all OACs.
+  # First fill for each ENROLID is forced to start episode 0.
 
-  # Deterministic ordering (dynamic)
-  cols <- c("ENROLID", if (isTRUE(by_drug)) "GENNME", "SVCDATE")
-  setorderv(dt, cols)
+  setorder(dt, ENROLID, SVCDATE, GENNME)
 
-  # Previous end within group; ensure the first row starts an episode
-  dt[, prev_end := shift(drug_end_plus_grace), by = grp]
-  dt[, anchor   := SVCDATE[1L],               by = grp]                      # first date in group
-  dt[, eff_prev := fifelse(is.na(prev_end), anchor, prev_end)]
-  dt[, days_since_last := as.integer(SVCDATE - eff_prev)]
-  dt[, gap_flag := fifelse(is.na(days_since_last) | (days_since_last > gap_allowed), 1L, 0L)]
-  dt[, episode_number := cumsum(gap_flag), by = grp]
-  dt[, c("prev_end","anchor","eff_prev") := NULL]
+  dt[, prev_end := shift(drug_end_plus_grace, fill = SVCDATE[1L]), by = ENROLID]
+  dt[, days_since_last := as.integer(SVCDATE - prev_end)]
 
-  # ---- 3) assign_index_date_and_med ----
-  # Within each (ENROLID, episode_number):
-  #   index_date   = first SVCDATE
-  #   age_at_index = first AGE
-  #   index_med    = GENNME of first row in episode (deterministic given sort)
-  #   oac_switch   = "match" if GENNME == index_med else "switch"
-  setorder(dt, ENROLID, episode_number, SVCDATE)
+  dt[, gap_flag := fifelse(
+    .I == .I[1L] | days_since_last > gap_allowed,  # first row or big gap
+    1L,
+    0L
+  ), by = ENROLID]
+
+  dt[, episode_number := cumsum(gap_flag), by = ENROLID]
+
+  dt[, prev_end := NULL]
+
+  # ---- 3) assign_index_date, age_at_index, index_med, oac_switch ----
+  # Now episodes are well-defined at the person level.
+
+  setorder(dt, ENROLID, episode_number, SVCDATE, GENNME)
+
   dt[, index_date   := SVCDATE[1L], by = .(ENROLID, episode_number)]
   dt[, age_at_index := AGE[1L],     by = .(ENROLID, episode_number)]
-  dt[, index_med    := GENNME[1L],  by = .(ENROLID, episode_number)]
-  # If you prefer tie-break by max DAYSUPP on the index day, use:
-  # dt[, index_med := GENNME[order(SVCDATE, -DAYSUPP)][1L], by = .(ENROLID, episode_number)]
+
+   # Pick index_med as drug on index_date; if multiple, use first after sort
+  dt[, index_med := GENNME[1L], by = .(ENROLID, episode_number)]
 
   dt[, oac_switch := fifelse(GENNME == index_med, "match", "switch")]
 
-  # ---- 4) filter_new_users_age ----
+  # ---- 4) filter for eligible episodes ----
   dt <- dt[index_date > earliest_index_date &
              !is.na(age_at_index) &
              age_at_index >= as.integer(age_criteria)]
 
-  # Return in a tidy order
   setorder(dt, ENROLID, episode_number, SVCDATE)
   dt[]
 }
 
+
 # ======================
-# Example usage:
-# (Assuming `cleaned_drug_data` from your earlier cleaner that retains AGE)
+
 all_neg_con_index <- postclean_assign_rules_dt(
   cleaned_drug_data,
   adherence_multiplier = 0.70,   # 70% adherent -> grace = 30% of DAYSUPP (capped by `cap`)
   cap = 30L,
-  gap_allowed = 30L,
-  earliest_index_date = "2009-07-01",
-  age_criteria = 18L,
-  by_drug = TRUE                 # gaps per drug (recommended)
+  gap_allowed = 183L,
+  earliest_index_date = "2009-07-02",
+  age_criteria = 18L
 )
 
 
@@ -597,7 +553,7 @@ write_parquet(all_neg_con_index_ce, file.path(proj_root, "data", "control", "all
 ```
 
 
-# Apply continuous exposure - data.table
+# Apply continuous exposure - data.table *HERE*
 ```{r}
 
 # Start from your big dataset
@@ -1119,528 +1075,6 @@ analytic_cohort_neg_con <- read_rds("C:/Users/kahanso2/OneDrive - University of 
 
 ```
 
-#Build Table 1 -skipped
-
-```{r}
-# =========================
-# Table 1 generation (revised)
-# =========================
-
-suppressPackageStartupMessages({
-  library(dplyr)
-  library(tidyr)
-  library(stringr)
-  library(arrow)
-  library(readxl)
-  library(gt)
-})
-
-# -------------------------
-# Helpers
-# -------------------------
-normalize_codes <- function(x) {
-  x <- as.character(x)
-  x <- gsub("\\.", "", x)
-  toupper(trimws(x))
-}
-
-# Extended flag function (exact matching after normalization)
-flag_condition_extended <- function(data, condition_name, 
-                                    icd9_vector, icd10_vector, 
-                                    proc_vector = NULL,
-                                    diag_cols,  
-                                    proc_cols) {
-  new_col <- paste0(condition_name, "_flag")
-  icd9_vector  <- normalize_codes(icd9_vector)
-  icd10_vector <- normalize_codes(icd10_vector)
-  if (!is.null(proc_vector)) proc_vector <- normalize_codes(proc_vector)
-
-  data %>%
-    mutate(
-      !!new_col := {
-        diag_flag <- case_when(
-          DXVER == 9 ~ rowSums(across(all_of(diag_cols), ~ normalize_codes(.) %in% icd9_vector),  na.rm = TRUE) > 0,
-          DXVER == 0 ~ rowSums(across(all_of(diag_cols), ~ normalize_codes(.) %in% icd10_vector), na.rm = TRUE) > 0,
-          TRUE ~ FALSE
-        )
-        if (!is.null(proc_vector) && length(proc_cols) > 0) {
-          proc_flag <- rowSums(across(all_of(proc_cols), ~ normalize_codes(.) %in% proc_vector), na.rm = TRUE) > 0
-          as.integer(diag_flag | proc_flag)
-        } else {
-          as.integer(diag_flag)
-        }
-      }
-    )
-}
-
-# Load claims, filter by lookback, flag HAS-BLED, summarise per ENROLID/index_date
-flag_hasbled_dataset <- function(dataset_path, diag_cols, proc_cols,
-                                 cohort_ids, cohort_ids_index,
-                                 lookback = 183,
-                                 date_col = "ADMDATE") {
-  date_sym <- rlang::sym(date_col)
-
-  claims <- open_dataset(dataset_path, unify_schemas = TRUE) %>%
-    select(ENROLID, YEAR, !!date_sym, DXVER, all_of(diag_cols), all_of(proc_cols)) %>%
-    filter(ENROLID %in% cohort_ids) %>%
-    collect() %>%
-    mutate(
-      across(all_of(diag_cols), ~ as.character(.x)),
-      across(all_of(proc_cols), ~ as.character(.x)),
-      !!date_sym := as.Date(!!date_sym),
-      DXVER = case_when(
-        DXVER %in% c("0","9") ~ as.numeric(DXVER),
-        is.na(DXVER) & (!!date_sym) >= as.Date("2015-10-01") ~ 0,
-        is.na(DXVER) & (!!date_sym) <  as.Date("2015-10-01") ~ 9,
-        TRUE ~ suppressWarnings(as.numeric(DXVER))
-      )
-    ) %>%
-    filter(!is.na(DXVER)) %>%
-    mutate(
-      across(all_of(diag_cols), normalize_codes),
-      across(all_of(proc_cols),  normalize_codes)
-    )
-
-  claims_indexed <- cohort_ids_index %>%
-    mutate(index_date = as.Date(index_date)) %>%
-    left_join(claims, by = "ENROLID") %>%
-    filter((!!date_sym) >= index_date - lookback,
-           (!!date_sym) <  index_date)   # exclude index day
-
-  claims_flagged <- claims_indexed %>%
-    flag_condition_extended("htn",    hasbled_htn_icd9,   hasbled_htn_icd10,   diag_cols = diag_cols, proc_cols = proc_cols) %>%
-    flag_condition_extended("liver",  hasbled_liver_icd9, hasbled_liver_icd10, diag_cols = diag_cols, proc_cols = proc_cols) %>%
-    flag_condition_extended("kidney", hasbled_kidney_icd9,hasbled_kidney_icd10,diag_cols = diag_cols, proc_cols = proc_cols) %>%
-    flag_condition_extended("stroke", hasbled_stroke_icd9,hasbled_stroke_icd10,diag_cols = diag_cols, proc_cols = proc_cols) %>%
-    flag_condition_extended("bleed",  hasbled_bleed_icd9, hasbled_bleed_icd10, diag_cols = diag_cols, proc_cols = proc_cols) %>%
-    flag_condition_extended("alc",    hasbled_alc_icd9,   hasbled_alc_icd10,   proc_vector = hasbled_alc_proc,
-                            diag_cols = diag_cols, proc_cols = proc_cols)
-
-  claims_flagged %>%
-    group_by(ENROLID, index_date) %>%
-    summarise(
-      hasbled_htn    = as.integer(sum(htn_flag,    na.rm = TRUE) > 0),
-      hasbled_liver  = as.integer(sum(liver_flag,  na.rm = TRUE) > 0),
-      hasbled_kidney = as.integer(sum(kidney_flag, na.rm = TRUE) > 0),
-      hasbled_stroke = as.integer(sum(stroke_flag, na.rm = TRUE) > 0),
-      hasbled_bleed  = as.integer(sum(bleed_flag,  na.rm = TRUE) > 0),
-      hasbled_alc    = as.integer(sum(alc_flag,    na.rm = TRUE) > 0),
-      .groups = "drop"
-    )
-}
-
-# -------------------------
-# 1) HAS-BLED flags from claims (inpatient + outpatient)
-# -------------------------
-dataset_path_i_ccae <- "//pharm-c-psop/TruvenData/Truven Data R/ccae/i"
-inpt_summary_ccae <- flag_hasbled_dataset(
-  dataset_path_i_ccae,
-  diag_cols = c("PDX", paste0("DX", 1:15)),
-  proc_cols = paste0("PROC", 1:15),
-  cohort_ids = cohort_ids,
-  cohort_ids_index = cohort_ids_index,
-  date_col = "ADMDATE"
-)
-
-dataset_path_i_mdcr <- "//pharm-c-psop/TruvenData/Truven Data R/mdcr/i"
-inpt_summary_mdcr <- flag_hasbled_dataset(
-  dataset_path_i_mdcr,
-  diag_cols = c("PDX", paste0("DX", 1:15)),
-  proc_cols = paste0("PROC", 1:15),
-  cohort_ids = cohort_ids,
-  cohort_ids_index = cohort_ids_index,
-  date_col = "ADMDATE"
-)
-
-dataset_path_o_ccae <- "//pharm-c-psop/TruvenData/Truven Data R/ccae/o"
-outpt_summary_ccae <- flag_hasbled_dataset(
-  dataset_path_o_ccae,
-  diag_cols = paste0("DX", 1:4),
-  proc_cols = "PROC1",
-  cohort_ids = cohort_ids,
-  cohort_ids_index = cohort_ids_index,
-  date_col = "SVCDATE"
-)
-
-dataset_path_o_mdcr <- "//pharm-c-psop/TruvenData/Truven Data R/mdcr/o"
-outpt_summary_mdcr <- flag_hasbled_dataset(
-  dataset_path_o_mdcr,
-  diag_cols = paste0("DX", 1:4),
-  proc_cols = "PROC1",
-  cohort_ids = cohort_ids,
-  cohort_ids_index = cohort_ids_index,
-  date_col = "SVCDATE"
-)
-
-combined_summary <- bind_rows(
-  inpt_summary_ccae, inpt_summary_mdcr,
-  outpt_summary_ccae, outpt_summary_mdcr
-) %>%
-  group_by(ENROLID, index_date) %>%
-  summarise(
-    hasbled_htn    = as.integer(sum(hasbled_htn,    na.rm = TRUE) > 0),
-    hasbled_liver  = as.integer(sum(hasbled_liver,  na.rm = TRUE) > 0),
-    hasbled_kidney = as.integer(sum(hasbled_kidney, na.rm = TRUE) > 0),
-    hasbled_stroke = as.integer(sum(hasbled_stroke, na.rm = TRUE) > 0),
-    hasbled_bleed  = as.integer(sum(hasbled_bleed,  na.rm = TRUE) > 0),
-    hasbled_alc    = as.integer(sum(hasbled_alc,    na.rm = TRUE) > 0),
-    .groups = "drop"
-  )
-
-# -------------------------
-# 2) Drug proxies for HAS-BLED D and A components
-# -------------------------
-hasbled_drugs <- read_excel(
-  "C:/Users/kahanso2/Documents/doac-ddi/codes/doac_ddi_codebook.xlsx",
-  sheet = "hasbled_drugs"
-)
-hasbled_bleed_drug <- hasbled_drugs$other_anticoag_hasbled
-hasbled_alc_drug   <- hasbled_drugs$alcohol_abuse_hasbled
-
-# safer regex escaper + finder
-esc <- function(x) {
-  x <- unique(na.omit(trimws(as.character(x))))
-  stringr::str_replace_all(x, "([\\^$.|?*+()\\[\\]{}])", "\\\\\\1")
-}
-get_ndc_by_drug_name_hasbled <- function(drug_list) {
-  terms <- esc(drug_list)
-  if (length(terms) == 0) return(character(0))
-  pat <- paste0("(?i)\\b(?:", paste(terms, collapse = "|"), ")\\b")
-  redbook %>%
-    mutate(GENNME = as.character(GENNME)) %>%
-    filter(stringr::str_detect(GENNME, stringr::regex(pat))) %>%
-    distinct(NDCNUM) %>%
-    pull()
-}
-hasbled_bleed_drug_ndc <- get_ndc_by_drug_name_hasbled(hasbled_bleed_drug)
-hasbled_alc_drug_ndc   <- get_ndc_by_drug_name_hasbled(hasbled_alc_drug)
-
-extract_hasbled_drug_data <- function(dataset_path, output_path, ndc_filter) {
-  drug_data <- open_dataset(dataset_path) %>%
-    select(ENROLID, NDCNUM, SVCDATE, YEAR, AGE, DAYSUPP) %>%
-    filter(ENROLID %in% cohort_ids) %>%
-    filter(NDCNUM %in% ndc_filter) %>%
-    collect()
-
-  drug_data_names <- drug_data %>%
-    left_join(redbook, by = "NDCNUM") %>%
-    select(ENROLID, NDCNUM, SVCDATE, YEAR, AGE, DAYSUPP, THRDTDS, THERCLS, GENNME, MASTFRM, ROADS)
-
-  write_parquet(drug_data_names, output_path)
-  drug_data_names
-}
-
-ccaed_drug_bleed <- extract_hasbled_drug_data(
-  dataset_path = "//pharm-c-psop/TruvenData/Truven Data R/ccae/d",
-  output_path  = "C:/Users/kahanso2/Documents/doac-ddi/data/ccaed_drug_bleed.parquet",
-  ndc_filter   = hasbled_bleed_drug_ndc
-)
-ccaed_drug_alc <- extract_hasbled_drug_data(
-  dataset_path = "//pharm-c-psop/TruvenData/Truven Data R/ccae/d",
-  output_path  = "C:/Users/kahanso2/Documents/doac-ddi/data/ccaed_drug_alc.parquet",
-  ndc_filter   = hasbled_alc_drug_ndc
-)
-mdcrd_drug_bleed <- extract_hasbled_drug_data(
-  dataset_path = "//pharm-c-psop/TruvenData/Truven Data R/mdcr/d",
-  output_path  = "C:/Users/kahanso2/Documents/doac-ddi/data/mdcrd_drug_bleed.parquet",
-  ndc_filter   = hasbled_bleed_drug_ndc
-)
-mdcrd_drug_alc <- extract_hasbled_drug_data(
-  dataset_path = "//pharm-c-psop/TruvenData/Truven Data R/mdcr/d",
-  output_path  = "C:/Users/kahanso2/Documents/doac-ddi/data/mdcrd_drug_alc.parquet",
-  ndc_filter   = hasbled_alc_drug_ndc
-)
-
-drug_all <- bind_rows(ccaed_drug_bleed, ccaed_drug_alc, mdcrd_drug_bleed, mdcrd_drug_alc)
-
-drug_flags <- cohort_ids_index %>%
-  mutate(index_date = as.Date(index_date)) %>%
-  left_join(drug_all, by = "ENROLID") %>%
-  filter(SVCDATE >= index_date - 183, SVCDATE < index_date) %>%  # exclude index day
-  group_by(ENROLID, index_date, age_at_index) %>%
-  summarise(
-    hasbled_bleed_drug = as.integer(n_distinct(NDCNUM[NDCNUM %in% hasbled_bleed_drug_ndc]) > 0),
-    hasbled_alc_drug   = as.integer(n_distinct(NDCNUM[NDCNUM %in% hasbled_alc_drug_ndc])   > 0),
-    .groups = "drop"
-  )
-
-# -------------------------
-# 3) Merge diagnoses + drug proxies → final HAS-BLED features
-# -------------------------
-final_hasbled <- combined_summary %>%
-  full_join(drug_flags, by = c("ENROLID", "index_date")) %>%
-  mutate(across(starts_with("hasbled_"), ~ replace_na(.x, 0))) %>%
-  mutate(
-    elderly = if_else(coalesce(age_at_index, 0) > 65, 1, 0),
-    alcohol = if_else(hasbled_alc == 1 | hasbled_alc_drug == 1, 1, 0),
-    drugs   = if_else(hasbled_bleed_drug == 1, 1, 0),
-    hasbled_score = hasbled_htn + hasbled_liver + hasbled_kidney +
-      hasbled_stroke + hasbled_bleed + elderly + drugs + alcohol
-  ) %>%
-  select(-age_at_index)
-
-# -------------------------
-# 4) Demographics + person-days
-# -------------------------
-demographics_data_ccae <- open_dataset("//pharm-c-psop/TruvenData/Truven Data R/ccae/t") %>%
-  select(ENROLID, PLANTYP, REGION, SEX, DTSTART, DTEND) %>%
-  filter(ENROLID %in% cohort_ids) %>%
-  collect()
-
-demographics_data_mdcr <- open_dataset("//pharm-c-psop/TruvenData/Truven Data R/mdcr/t") %>%
-  select(ENROLID, PLANTYP, REGION, SEX, DTSTART, DTEND) %>%
-  filter(ENROLID %in% cohort_ids) %>%
-  collect()
-
-demo_data_all <- bind_rows(demographics_data_ccae, demographics_data_mdcr) %>% distinct()
-
-cohort_ids_index_demo <- cohort_ids_index %>%
-  left_join(demo_data_all, by = "ENROLID") %>%
-  filter(DTSTART <= index_date) %>%
-  group_by(ENROLID, index_date) %>%
-  slice_max(DTSTART, with_ties = FALSE) %>%
-  ungroup() %>%
-  select(-c(DTSTART, DTEND, age_at_index))
-
-person_days_data <- analytic_cohort_oac_2 %>%
-  select(ENROLID, index_date, day_obs_start, day_obs_end) %>%
-  distinct() %>%
-  group_by(ENROLID, index_date) %>%
-  summarise(total_person_days = sum(day_obs_end - day_obs_start, na.rm = TRUE), .groups = 'drop')
-
-# -------------------------
-# 5) Assemble final table dataset
-# -------------------------
-final_table_data <- analytic_cohort_oac_2 %>%
-  left_join(cohort_ids_index_demo, by = c("ENROLID", "index_date")) %>%
-  left_join(final_hasbled,        by = c("ENROLID", "index_date")) %>%
-  left_join(person_days_data,     by = c("ENROLID", "index_date")) %>%
-  mutate(object = recode(object,
-                         "Warfarin Sodium" = "Warfarin",
-                         "Dabigatran Etexilate Mesylate" = "Dabigatran"))
-
-# Quick wide summaries
-table1 <- final_table_data %>%
-  group_by(object) %>%
-  summarise(
-    cases    = n_distinct(ENROLID),
-    obs_days = sum(total_person_days, na.rm = TRUE),
-    events   = n(),
-    female_n  = sum(as.character(SEX) == "2", na.rm = TRUE),  # 2 = Female
-    female_pct= 100 * female_n / n_distinct(ENROLID),
-    mean_age  = mean(age_at_index, na.rm = TRUE),
-    sd_age    = sd(age_at_index,   na.rm = TRUE),
-    age_18_44 = sum(age_group_index == "18-44", na.rm = TRUE),
-    age_45_64 = sum(age_group_index == "45-64", na.rm = TRUE),
-    age_65_74 = sum(age_group_index == "65-74", na.rm = TRUE),
-    age_75_84 = sum(age_group_index == "75-84", na.rm = TRUE),
-    age_85_90 = sum(age_group_index == "85-90", na.rm = TRUE),
-    age_over_90 = sum(age_group_index == ">90", na.rm = TRUE),
-    region   = names(sort(table(REGION),  decreasing = TRUE))[1],
-    plan_type= names(sort(table(PLANTYP), decreasing = TRUE))[1],
-    mean_hasbled = mean(hasbled_score, na.rm = TRUE),
-    prop_htn    = 100 * mean(hasbled_htn,    na.rm = TRUE),
-    prop_liver  = 100 * mean(hasbled_liver,  na.rm = TRUE),
-    prop_kidney = 100 * mean(hasbled_kidney, na.rm = TRUE),
-    prop_stroke = 100 * mean(hasbled_stroke, na.rm = TRUE),
-    prop_bleed  = 100 * mean(hasbled_bleed,  na.rm = TRUE),
-    prop_alc    = 100 * mean(hasbled_alc,    na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
-  mutate(
-    mean_age = round(mean_age, 2),
-    sd_age   = round(sd_age,   2),
-    mean_hasbled = round(mean_hasbled, 2),
-    across(c(female_pct, prop_htn, prop_liver, prop_kidney, prop_stroke, prop_bleed, prop_alc), ~ round(., 1))
-  )
-
-# -------------------------
-# 6) Publication-style long Table 1
-# -------------------------
-cases_by_object <- final_table_data %>%
-  group_by(object) %>%
-  summarise(total_cases = n_distinct(ENROLID), .groups = "drop")
-
-cases_summary <- final_table_data %>%
-  group_by(object) %>%
-  summarise(value = n_distinct(ENROLID), .groups = "drop") %>%
-  mutate(Characteristic = "Number of Cases") %>%
-  select(Characteristic, object, value)
-
-obs_summary <- final_table_data %>%
-  group_by(object) %>%
-  summarise(value = sum(total_person_days, na.rm = TRUE), .groups = "drop") %>%
-  mutate(value = format(value, big.mark = ",")) %>%
-  mutate(Characteristic = "Observation Days (Person-days)") %>%
-  select(Characteristic, object, value)
-
-event_summary <- final_table_data %>%
-  group_by(object) %>%
-  summarise(value = n(), .groups = "drop") %>%
-  mutate(Characteristic = "Number of Events") %>%
-  select(Characteristic, object, value)
-
-sex_summary <- final_table_data %>%
-  group_by(object, SEX) %>%
-  summarise(count = n_distinct(ENROLID), .groups = "drop") %>%
-  mutate(SEX = recode(as.character(SEX), "1"="Male","2"="Female")) %>%
-  left_join(cases_by_object, by = "object") %>%
-  mutate(perc = round(100 * count / total_cases, 1),
-         value = paste0(count, " (", perc, "%)"),
-         Characteristic = paste0("Sex: ", SEX)) %>%
-  select(Characteristic, object, value)
-
-age_summary <- final_table_data %>%
-  group_by(object) %>%
-  summarise(mean_age = mean(age_at_index, na.rm = TRUE),
-            sd_age   = sd(age_at_index,   na.rm = TRUE), .groups = "drop") %>%
-  mutate(value = paste0(round(mean_age,2), " (", round(sd_age,2), ")"),
-         Characteristic = "Mean Age (SD)") %>%
-  select(Characteristic, object, value)
-
-agegroup_summary <- final_table_data %>%
-  mutate(age_group = case_when(
-    age_at_index < 45 ~ "18-44",
-    age_at_index < 65 ~ "45-64",
-    age_at_index < 75 ~ "65-74",
-    age_at_index < 85 ~ "75-84",
-    TRUE ~ "85+"
-  )) %>%
-  group_by(object, age_group) %>%
-  summarise(count = n_distinct(ENROLID), .groups = "drop") %>%
-  left_join(cases_by_object, by = "object") %>%
-  mutate(perc = round(100 * count / total_cases, 1),
-         value = paste0(count, " (", perc, "%)"),
-         Characteristic = paste0("Age ", age_group, " (n, %)")) %>%
-  select(Characteristic, object, value)
-
-region_summary <- final_table_data %>%
-  group_by(object, REGION) %>%
-  summarise(count = n_distinct(ENROLID), .groups = "drop") %>%
-  mutate(REGION = recode(as.character(REGION),
-                         "1"="Northeast","2"="North Central","3"="South","4"="West","5"="Unknown")) %>%
-  left_join(cases_by_object, by = "object") %>%
-  mutate(perc = round(100 * count / total_cases, 1),
-         value = paste0(count, " (", perc, "%)"),
-         Characteristic = paste0("Region: ", REGION)) %>%
-  select(Characteristic, object, value)
-
-plan_summary <- final_table_data %>%
-  group_by(object, PLANTYP) %>%
-  summarise(count = n_distinct(ENROLID), .groups = "drop") %>%
-  mutate(PLANTYP = recode(as.character(PLANTYP),
-                          "1"="Basic/major medical","2"="Comprehensive","3"="EPO","4"="HMO",
-                          "5"="POS","6"="PPO","7"="POS with capitation","8"="CDHP","9"="HDHP")) %>%
-  left_join(cases_by_object, by = "object") %>%
-  mutate(perc = round(100 * count / total_cases, 1),
-         value = paste0(count, " (", perc, "%)"),
-         Characteristic = paste0("Plan Type: ", PLANTYP)) %>%
-  select(Characteristic, object, value)
-
-hasbled_score_summary <- final_table_data %>%
-  group_by(object) %>%
-  summarise(mean_hasbled = mean(hasbled_score, na.rm = TRUE), .groups = "drop") %>%
-  mutate(value = as.character(round(mean_hasbled, 2)),
-         Characteristic = "Mean HAS-BLED Score") %>%
-  select(Characteristic, object, value)
-
-htn_summary <- final_table_data %>%
-  group_by(object) %>%
-  summarise(count = sum(hasbled_htn, na.rm = TRUE), .groups = "drop") %>%
-  left_join(cases_by_object, by = "object") %>%
-  mutate(perc = round(100 * count / total_cases, 1),
-         value = paste0(count, " (", perc, "%)"),
-         Characteristic = "HAS-BLED: Hypertension") %>%
-  select(Characteristic, object, value)
-
-liver_summary <- final_table_data %>%
-  group_by(object) %>%
-  summarise(count = sum(hasbled_liver, na.rm = TRUE), .groups = "drop") %>%
-  left_join(cases_by_object, by = "object") %>%
-  mutate(perc = round(100 * count / total_cases, 1),
-         value = paste0(count, " (", perc, "%)"),
-         Characteristic = "HAS-BLED: Liver Dysfunction") %>%
-  select(Characteristic, object, value)
-
-kidney_summary <- final_table_data %>%
-  group_by(object) %>%
-  summarise(count = sum(hasbled_kidney, na.rm = TRUE), .groups = "drop") %>%
-  left_join(cases_by_object, by = "object") %>%
-  mutate(perc = round(100 * count / total_cases, 1),
-         value = paste0(count, " (", perc, "%)"),
-         Characteristic = "HAS-BLED: Kidney Dysfunction") %>%
-  select(Characteristic, object, value)
-
-stroke_summary <- final_table_data %>%
-  group_by(object) %>%
-  summarise(count = sum(hasbled_stroke, na.rm = TRUE), .groups = "drop") %>%
-  left_join(cases_by_object, by = "object") %>%
-  mutate(perc = round(100 * count / total_cases, 1),
-         value = paste0(count, " (", perc, "%)"),
-         Characteristic = "HAS-BLED: Stroke") %>%
-  select(Characteristic, object, value)
-
-bleed_summary <- final_table_data %>%
-  group_by(object) %>%
-  summarise(count = sum(hasbled_bleed, na.rm = TRUE), .groups = "drop") %>%
-  left_join(cases_by_object, by = "object") %>%
-  mutate(perc = round(100 * count / total_cases, 1),
-         value = paste0(count, " (", perc, "%)"),
-         Characteristic = "HAS-BLED: Bleeding Predisposition") %>%
-  select(Characteristic, object, value)
-
-alc_summary <- final_table_data %>%
-  group_by(object) %>%
-  summarise(count = sum(hasbled_alc, na.rm = TRUE), .groups = "drop") %>%
-  left_join(cases_by_object, by = "object") %>%
-  mutate(perc = round(100 * count / total_cases, 1),
-         value = paste0(count, " (", perc, "%)"),
-         Characteristic = "HAS-BLED: Alcohol Use") %>%
-  select(Characteristic, object, value)
-
-# Standardize & bind summaries (prevents type-mix errors)
-.std_summary <- function(df) {
-  df %>%
-    mutate(
-      Characteristic = as.character(Characteristic),
-      object         = as.character(object),
-      value          = as.character(value)
-    ) %>%
-    select(Characteristic, object, value)
-}
-
-all_summaries <- bind_rows(
-  .std_summary(cases_summary),
-  .std_summary(obs_summary),
-  .std_summary(event_summary),
-  .std_summary(sex_summary),
-  .std_summary(age_summary),
-  .std_summary(agegroup_summary),
-  .std_summary(region_summary),
-  .std_summary(plan_summary),
-  .std_summary(hasbled_score_summary),
-  .std_summary(htn_summary),
-  .std_summary(liver_summary),
-  .std_summary(kidney_summary),
-  .std_summary(stroke_summary),
-  .std_summary(bleed_summary),
-  .std_summary(alc_summary)
-)
-
-final_table1 <- all_summaries %>%
-  tidyr::pivot_wider(names_from = object, values_from = value)
-
-# GT table
-pub_table <- final_table1 %>%
-  gt(rowname_col = "Characteristic") %>%
-  tab_header(title = "Table 1: Baseline Characteristics by Drug Group") %>%
-  tab_options(table.font.size = 12, data_row.padding = px(5)) %>%
-  tab_source_note(source_note = "Note: Values are reported as n (%), Mean (SD), or as indicated.")
-
-pub_table
-gtsave(pub_table, "table1.html")
-```
-
 # Generate outcome datasets for each object drug
 
 ```{r}
@@ -1907,7 +1341,7 @@ saveRDS(
   file.path(proj_root, "data/control/loop_datasets/oac_spans_negcon.rds")
 )
 ```
-
+# Save/Reload Datasets for Loop
 ```{r}
 # ===============================
 # Save datasets for each OAC
@@ -2487,6 +1921,7 @@ library(data.table)
 compute_ratio_vs_lisinopril <- function(label,
                                         prior_suffix = "prior025",
                                         nc_object = "Lisinopril") {
+
   # ---- 1) Build file paths ----
   oac_path <- file.path(proj_root, "results",
                         paste0(label, "_shrunk_", prior_suffix, ".rds"))
@@ -2500,16 +1935,25 @@ compute_ratio_vs_lisinopril <- function(label,
   oac_dt <- as.data.table(readRDS(oac_path))
   nc_dt  <- as.data.table(readRDS(nc_path))
 
-  # Sanity check columns
-  needed <- c("object", "drug", "shrunken_log_rr", "post_se_log")
-  if (!all(needed %in% names(oac_dt))) stop("OAC table missing needed columns: ", paste(setdiff(needed, names(oac_dt)), collapse = ", "))
-  if (!all(needed %in% names(nc_dt)))  stop("Control table missing needed columns: ", paste(setdiff(needed, names(nc_dt)), collapse = ", "))
+  needed <- c("object", "drug", "shrunken_log_rr", "post_se_log",
+              "shrunken_irr", "lower_ci", "upper_ci")
+  if (!all(needed %in% names(oac_dt))) {
+    stop("OAC table missing needed columns: ",
+         paste(setdiff(needed, names(oac_dt)), collapse = ", "))
+  }
+  if (!all(needed %in% names(nc_dt))) {
+    stop("Control table missing needed columns: ",
+         paste(setdiff(needed, names(nc_dt)), collapse = ", "))
+  }
 
-  # ---- 3) Get negative-control (Lisinopril) rows by drug ----
+  # ---- 3) Negative control (Lisinopril) rows by drug ----
   nc_sub <- nc_dt[object == nc_object,
                   .(drug,
-                    log_rr_nc = shrunken_log_rr,
-                    var_nc    = post_se_log^2)]
+                    log_rr_nc  = shrunken_log_rr,
+                    var_nc     = post_se_log^2,
+                    irr_nc     = shrunken_irr,
+                    lower_nc   = lower_ci,
+                    upper_nc   = upper_ci)]
 
   if (nrow(nc_sub) == 0L) {
     stop("No rows found for negative-control object '", nc_object,
@@ -2522,29 +1966,73 @@ compute_ratio_vs_lisinopril <- function(label,
   out_list <- lapply(objects, function(obj) {
     o <- oac_dt[object == obj,
                 .(drug,
-                  log_rr_o = shrunken_log_rr,
-                  var_o    = post_se_log^2)]
+                  log_rr_o  = shrunken_log_rr,
+                  var_o     = post_se_log^2,
+                  irr_oac   = shrunken_irr,
+                  lower_oac = lower_ci,
+                  upper_oac = upper_ci)]
 
     m <- merge(o, nc_sub, by = "drug", all = FALSE)
     if (!nrow(m)) return(NULL)
 
+    # ---- 4a) Compute ratio quantities ----
     m[, `:=`(
       object        = obj,
       log_ratio     = log_rr_o - log_rr_nc,
-      var_log_ratio = var_o + var_nc,
-      se_log_ratio  = sqrt(var_o + var_nc),
-      ratio_rr      = exp(log_rr_o - log_rr_nc),
-      ratio_lower   = exp((log_rr_o - log_rr_nc) - 1.96 * sqrt(var_o + var_nc)),
-      ratio_upper   = exp((log_rr_o - log_rr_nc) + 1.96 * sqrt(var_o + var_nc)),
-      ratio_z       = (log_rr_o - log_rr_nc) / sqrt(var_o + var_nc),
-      ratio_p       = 2 * pnorm(abs((log_rr_o - log_rr_nc) / sqrt(var_o + var_nc)), lower.tail = FALSE),
-      ratio_sig_any = (exp((log_rr_o - log_rr_nc) - 1.96 * sqrt(var_o + var_nc)) > 1 |
-                       exp((log_rr_o - log_rr_nc) + 1.96 * sqrt(var_o + var_nc)) < 1)
+      var_log_ratio = var_o + var_nc
     )]
 
+    m[, se_log_ratio := sqrt(var_log_ratio)]
+
+    # Make sure we don't divide by zero / NA
+    m[!is.finite(se_log_ratio) | se_log_ratio == 0, se_log_ratio := NA_real_]
+
+    m[, `:=`(
+      ratio_rr    = exp(log_ratio),
+      ratio_lower = exp(log_ratio - 1.96 * se_log_ratio),
+      ratio_upper = exp(log_ratio + 1.96 * se_log_ratio)
+    )]
+
+    # ---- 4b) z and p for ratio (create BEFORE any later use) ----
+    m[, ratio_z := log_ratio / se_log_ratio]
+    m[, ratio_p := 2 * pnorm(abs(ratio_z), lower.tail = FALSE)]
+    m[, ratio_sig_any := (ratio_lower > 1 | ratio_upper < 1)]
+
+    # ---- 5) Pattern classification (point-estimate based) ----
+    # Use data.table::fcase; OK if not present in your version? If not, you
+    # can swap to nested fifelse – but fcase should be fine on recent data.table.
+    m[, ddi_pattern := fcase(
+      # Harmful OAC-specific patterns
+      irr_oac > 1 & irr_nc >= 1 & ratio_rr > 1,
+      "Harmful DDI: harmful in both, more harmful with OAC",
+
+      irr_oac > 1 & irr_nc < 1 & ratio_rr > 1,
+      "Harmful DDI: harmful with OAC, protective with NC",
+
+      irr_oac > 1 & irr_nc >= 0.9 & irr_nc <= 1.1 & ratio_rr > 1,
+      "Harmful DDI: harmful only with OAC (NC ~ 1)",
+
+      # Protective OAC-specific patterns
+      irr_oac < 1 & irr_nc <= 1 & ratio_rr < 1,
+      "Protective DDI: protective in both, more protective with OAC",
+
+      irr_oac < 1 & irr_nc > 1 & ratio_rr < 1,
+      "Protective DDI: protective with OAC, harmful with NC",
+
+      irr_oac < 1 & irr_nc >= 0.9 & irr_nc <= 1.1 & ratio_rr < 1,
+      "Protective DDI: protective only with OAC (NC ~ 1)",
+
+      # Fallback
+      default = "No clear OAC-specific effect"
+    )]
+
+    # ---- 6) Final selection: only after ratio_z exists ----
     m[, .(object, drug,
+          irr_oac, lower_oac, upper_oac,
+          irr_nc,  lower_nc,  upper_nc,
           ratio_rr, ratio_lower, ratio_upper,
-          ratio_z, ratio_p, ratio_sig_any)]
+          ratio_z, ratio_p, ratio_sig_any,
+          ddi_pattern)]
   })
 
   ratio_dt <- rbindlist(out_list, use.names = TRUE, fill = TRUE)
@@ -2554,12 +2042,15 @@ compute_ratio_vs_lisinopril <- function(label,
     return(invisible(NULL))
   }
 
-  # ---- 5) Save output ----
-  stem <- paste0("ratio_vs_lisinopril_", label, "_", prior_suffix)
+  # ---- 7) Save output ----
+  dir.create(file.path(proj_root, "results", "ratio_of_ratios"),
+             showWarnings = FALSE, recursive = TRUE)
+
+  stem    <- paste0("ratio_vs_lisinopril_", label, "_", prior_suffix)
   out_csv <- file.path(proj_root, "results", "ratio_of_ratios", paste0(stem, ".csv"))
   out_rds <- file.path(proj_root, "results", "ratio_of_ratios", paste0(stem, ".rds"))
 
-  data.table::fwrite(ratio_dt, out_csv)
+  fwrite(ratio_dt, out_csv)
   saveRDS(ratio_dt, out_rds)
 
   message("Saved ratio-of-ratios vs Lisinopril to:\n  ", out_csv, "\n  ", out_rds)
@@ -2572,6 +2063,586 @@ ratio_unadj_067 <- compute_ratio_vs_lisinopril("unadjusted", "prior067")
 ratio_adj_025   <- compute_ratio_vs_lisinopril("adjusted",   "prior025")
 ratio_adj_067   <- compute_ratio_vs_lisinopril("adjusted",   "prior067")
 
+
+```
+
+
+# Build Table of Results
+```{r}
+library(data.table)
+library(dplyr)
+
+build_ddi_screen_table <- function(label = "unadjusted",
+                                   prior_suffix = "prior025",
+                                   proj_root,
+                                   nc_object = "Lisinopril") {
+  # ---- 1) Paths ----
+  oac_path <- file.path(proj_root, "results",
+                        paste0(label, "_shrunk_", prior_suffix, ".rds"))
+  nc_path  <- file.path(proj_root, "results", "control",
+                        paste0(label, "_shrunk_", prior_suffix, ".rds"))
+  ror_path <- file.path(proj_root, "results", "ratio_of_ratios",
+                        paste0("ratio_vs_lisinopril_", label, "_", prior_suffix, ".rds"))
+  
+  if (!file.exists(oac_path)) stop("OAC file not found: ", oac_path)
+  if (!file.exists(nc_path))  stop("NC file not found: ", nc_path)
+  if (!file.exists(ror_path)) stop("RoR file not found: ", ror_path)
+  
+  # ---- 2) Read and convert to data.table ----
+  oac <- as.data.table(readRDS(oac_path))
+  nc  <- as.data.table(readRDS(nc_path))
+  ror <- as.data.table(readRDS(ror_path))
+  
+  # basic checks
+  needed_cols <- c("object", "drug", "shrunken_irr", "lower_ci", "upper_ci", "p_shrunk")
+  if (!all(needed_cols %in% names(oac))) stop("OAC table missing: ", 
+                                             paste(setdiff(needed_cols, names(oac)), collapse = ", "))
+  if (!all(needed_cols %in% names(nc)))  stop("NC table missing: ", 
+                                             paste(setdiff(needed_cols, names(nc)), collapse = ", "))
+  
+  # ---- 3) Restrict to OAC hits only (primary screen) ----
+  oac_hits <- oac[sig_any == TRUE & is.finite(shrunken_irr)]
+  
+  if (nrow(oac_hits) == 0L) {
+    warning("No significant OAC hits found for label=", label, ", prior=", prior_suffix)
+    return(invisible(NULL))
+  }
+  
+  # keep the essentials
+  oac_hits_small <- oac_hits[, .(
+    object,
+    drug,
+    irr_oac   = shrunken_irr,
+    lower_oac = lower_ci,
+    upper_oac = upper_ci,
+    p_oac     = p_shrunk
+  )]
+  
+  # ---- 4) Prepare NC and RoR tables ----
+  # NC: we don't filter by sig; we just describe bias
+  nc_small <- nc[, .(
+    drug,
+    irr_nc   = shrunken_irr,
+    lower_nc = lower_ci,
+    upper_nc = upper_ci,
+    p_nc     = p_shrunk
+  )]
+  
+  # RoR table already computed vs Lisinopril
+  if (!all(c("object", "drug", "ratio_rr", "ratio_lower", "ratio_upper", "ratio_p") %in% names(ror))) {
+    stop("RoR table missing required columns.")
+  }
+  
+  ror_small <- ror[, .(
+    object,
+    drug,
+    ratio_rr,
+    ratio_lower,
+    ratio_upper,
+    ratio_p
+  )]
+  
+  # ---- 5) Merge: start from OAC hits, then add NC, then RoR ----
+  setkey(oac_hits_small, drug)
+  setkey(nc_small,       drug)
+  setkey(ror_small,      object, drug)
+  
+  # join OAC + NC by drug
+  dd <- merge(oac_hits_small, nc_small, by = "drug", all.x = TRUE)
+  
+  # join in RoR by object+drug
+  setkey(dd, object, drug)
+  dd <- merge(dd, ror_small, by = c("object", "drug"), all.x = TRUE)
+  
+  # ---- 6) Classify directions and DDI pattern ----
+  dd <- dd %>%
+    mutate(
+      dir_oac = case_when(
+        lower_oac > 1 ~ "harmful",
+        upper_oac < 1 ~ "protective",
+        TRUE          ~ "null"
+      ),
+      dir_nc = case_when(
+        !is.na(lower_nc) & lower_nc > 1 ~ "harmful",
+        !is.na(upper_nc) & upper_nc < 1 ~ "protective",
+        TRUE                            ~ "null"
+      ),
+      ddi_pattern = case_when(
+        # No NC data
+        is.na(irr_nc) ~ "OAC signal; no NC data",
+        
+        # OAC harmful, NC null
+        dir_oac == "harmful" & dir_nc == "null" ~
+          "Harmful DDI candidate (harmful with OAC only)",
+        
+        # OAC protective, NC null
+        dir_oac == "protective" & dir_nc == "null" ~
+          "Protective DDI candidate (protective with OAC only)",
+        
+        # OAC & NC both harmful
+        dir_oac == "harmful" & dir_nc == "harmful" & !is.na(ratio_rr) & ratio_lower > 1 ~
+          "Both harmful; stronger with OAC (RoR > 1)",
+        dir_oac == "harmful" & dir_nc == "harmful" & !is.na(ratio_rr) & ratio_upper < 1 ~
+          "Both harmful; weaker with OAC (RoR < 1)",
+        dir_oac == "harmful" & dir_nc == "harmful" ~
+          "Both harmful; similar effect (RoR ~ 1)",
+        
+        # OAC & NC both protective
+        dir_oac == "protective" & dir_nc == "protective" & !is.na(ratio_rr) & ratio_upper < 1 ~
+          "Both protective; stronger with OAC (RoR < 1)",
+        dir_oac == "protective" & dir_nc == "protective" & !is.na(ratio_rr) & ratio_lower > 1 ~
+          "Both protective; weaker with OAC (RoR > 1)",
+        dir_oac == "protective" & dir_nc == "protective" ~
+          "Both protective; similar effect (RoR ~ 1)",
+        
+        # Protective with OAC, harmful with NC
+        dir_oac == "protective" & dir_nc == "harmful" ~
+          "Protective DDI: protective with OAC, harmful with NC",
+        
+        # Harmful with OAC, protective with NC
+        dir_oac == "harmful" & dir_nc == "protective" ~
+          "Harmful DDI: harmful with OAC, protective with NC",
+        
+        # OAC null, NC non-null (shouldn't appear if we filtered to OAC hits, but keep logic)
+        dir_oac == "null" & dir_nc != "null" ~
+          "No OAC signal; NC signal only (likely bias)",
+        
+        TRUE ~ "Inconclusive pattern"
+      )
+    )
+  
+  # optional: a flag for RoR “significance”
+  dd <- dd %>%
+    mutate(
+      ratio_sig_any = ifelse(!is.na(ratio_lower) & (ratio_lower > 1 | ratio_upper < 1), TRUE, FALSE)
+    )
+  
+  # ---- 7) Order and save ----
+  dd <- dd %>%
+    select(
+      object, drug,
+      irr_oac, lower_oac, upper_oac, p_oac,
+      irr_nc,  lower_nc,  upper_nc,  p_nc,
+      ratio_rr, ratio_lower, ratio_upper, ratio_p, ratio_sig_any,
+      dir_oac, dir_nc, ddi_pattern
+    ) %>%
+    arrange(object, desc(irr_oac))
+  
+  out_csv <- file.path(proj_root, "results", "ratio_of_ratios",
+                       paste0("ddi_screen_table_", label, "_", prior_suffix, ".csv"))
+  out_rds <- file.path(proj_root, "results", "ratio_of_ratios",
+                       paste0("ddi_screen_table_", label, "_", prior_suffix, ".rds"))
+  
+  dir.create(file.path(proj_root, "results", "ratio_of_ratios"), showWarnings = FALSE, recursive = TRUE)
+  
+  fwrite(as.data.table(dd), out_csv)
+  saveRDS(dd, out_rds)
+  
+  message("DDI screen table saved to:\n  ", out_csv, "\n  ", out_rds)
+  return(dd)
+}
+
+ddi_unadj_025 <- build_ddi_screen_table(
+  label = "unadjusted",
+  prior_suffix = "prior025",
+  proj_root = proj_root,    # assuming this is defined already
+  nc_object = "Lisinopril"  # consistent with your ratio code
+)
+
+
+```
+
+# Manuscript Tables
+```{r}
+# ============================================
+# Build Zhou-style Tables 2 and 3
+#   - Uses:
+#       proj_root/results/unadjusted_shrunk_prior025.rds
+#       proj_root/results/ratio_of_ratios/ddi_screen_table_unadjusted_prior025.rds
+#   - Produces:
+#       proj_root/results/tables/table2_oac_screen_summary_unadj_prior025.{csv,rds}
+#       proj_root/results/tables/table3_ddi_candidates_unadj_prior025.{csv,rds}
+# ============================================
+
+library(data.table)
+library(dplyr)
+
+# ---- 1) Paths ----
+oac_shrunk_path <- file.path(proj_root, "results", "unadjusted_shrunk_prior025.rds")
+ddi_path        <- file.path(proj_root, "results", "ratio_of_ratios",
+                             "ddi_screen_table_unadjusted_prior025.rds")
+
+if (!file.exists(oac_shrunk_path)) {
+  stop("OAC shrunk file not found: ", oac_shrunk_path)
+}
+
+# ---- 2) Ensure DDI table exists (build if needed) ----
+if (!file.exists(ddi_path)) {
+  if (!exists("build_ddi_screen_table")) {
+    stop(
+      "DDI screen table not found at:\n  ", ddi_path,
+      "\n and build_ddi_screen_table() is not in the environment."
+    )
+  }
+  message("DDI screen table not found; creating via build_ddi_screen_table()...")
+  ddi_unadj_025 <- build_ddi_screen_table(
+    label       = "unadjusted",
+    prior_suffix = "prior025",
+    proj_root   = proj_root,
+    nc_object   = "Lisinopril"
+  )
+}
+
+# Read the DDI table (or reuse if already in memory)
+ddi_results <- if (exists("ddi_unadj_025")) {
+  ddi_unadj_025
+} else {
+  readRDS(ddi_path)
+}
+ddi_results <- as.data.table(ddi_results)
+
+# Read OAC shrunk results
+oac_shrunk <- as.data.table(readRDS(oac_shrunk_path))
+
+# ---- 3) Table 2A: overall OAC screen summary (by OAC object) ----
+#   - Number of precipitants
+#   - Number with an estimate
+#   - Number with significant shrunk RR
+table2_overall <- oac_shrunk[
+  is.finite(shrunken_irr),
+  .(
+    n_precipitants  = uniqueN(drug),
+    n_with_estimate = sum(!is.na(shrunken_irr)),
+    n_sig_shrunk    = sum(sig_any %in% TRUE)
+  ),
+  by = object
+][order(object)]
+
+# ---- 4) Table 2B: summary restricted to OAC hits + RoR (based on ddi_results) ----
+table2_hits <- ddi_results[
+  ,
+  .(
+    n_precipitants_sig_oac = uniqueN(drug),
+    n_sig_ror              = sum(ratio_sig_any %in% TRUE)
+  ),
+  by = object
+][order(object)]
+
+# Merge into a single Table 2
+table2 <- merge(table2_overall, table2_hits, by = "object", all.x = TRUE)
+setorder(table2, object)
+
+# ---- 5) Table 3: detailed DDI candidates (Zhou-style) ----
+# You can uncomment the filter(ratio_sig_any == TRUE) line if you want to
+# restrict to RoR-significant hits only.
+table3 <- ddi_results %>%
+  # Optionally restrict to ratio-of-ratios significant:
+  # filter(ratio_sig_any == TRUE) %>%
+  arrange(object, desc(irr_oac)) %>%
+  mutate(
+    irr_oac_ci = sprintf("%.2f (%.2f, %.2f)", irr_oac, lower_oac, upper_oac),
+    irr_nc_ci  = ifelse(
+      is.na(irr_nc),
+      NA_character_,
+      sprintf("%.2f (%.2f, %.2f)", irr_nc, lower_nc, upper_nc)
+    ),
+    ror_ci     = ifelse(
+      is.na(ratio_rr),
+      NA_character_,
+      sprintf("%.2f (%.2f, %.2f)", ratio_rr, ratio_lower, ratio_upper)
+    ),
+    # Placeholder for manual annotation of DDI mechanism
+    mechanism  = NA_character_
+  ) %>%
+  select(
+    object, drug,
+    irr_oac_ci,
+    irr_nc_ci,
+    ror_ci,
+    ddi_pattern,
+    mechanism
+  )
+
+table3 <- as.data.table(table3)
+
+# ---- 6) Save tables ----
+out_dir <- file.path(proj_root, "results", "tables")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Table 2
+fwrite(table2, file.path(out_dir, "table2_oac_screen_summary_unadj_prior025.csv"))
+saveRDS(table2, file.path(out_dir, "table2_oac_screen_summary_unadj_prior025.rds"))
+
+# Table 3
+fwrite(table3, file.path(out_dir, "table3_ddi_candidates_unadj_prior025.csv"))
+saveRDS(table3, file.path(out_dir, "table3_ddi_candidates_unadj_prior025.rds"))
+
+message("Table 2 saved to: ", file.path(out_dir, "table2_oac_screen_summary_unadj_prior025.{csv,rds}"))
+message("Table 3 saved to: ", file.path(out_dir, "table3_ddi_candidates_unadj_prior025.{csv,rds}"))
+
+```
+
+# Manuscript Tables 2
+```{r}
+# ============================================
+# Build Zhou-style Tables 2 & 3 as GT tables
+#   – Uses:
+#       proj_root/results/sccs_results_unadjusted.rds
+#       proj_root/results/unadjusted_shrunk_prior025.rds
+#       proj_root/results/ratio_of_ratios/ddi_screen_table_unadjusted_prior025.rds
+#       proj_root/data/loop_datasets/*_vector.rds
+#   – Produces:
+#       proj_root/results/tables/table2_zhou_style_unadj_prior025.{csv,rds,html}
+#       proj_root/results/tables/table3_ddi_candidates_unadj_prior025.{csv,rds,html}
+# ============================================
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(stringr)
+  library(gt)
+})
+
+# ---- 1) Paths ----
+res_unadj_path   <- file.path(proj_root, "results", "sccs_results_unadjusted.rds")
+shrunk_path      <- file.path(proj_root, "results", "unadjusted_shrunk_prior025.rds")
+ddi_path         <- file.path(proj_root, "results", "ratio_of_ratios",
+                              "ddi_screen_table_unadjusted_prior025.rds")
+
+vec_dir          <- file.path(proj_root, "data", "loop_datasets")
+vec_paths <- list(
+  Apixaban    = file.path(vec_dir, "apixaban_vector.rds"),
+  Rivaroxaban = file.path(vec_dir, "rivaroxaban_vector.rds"),
+  Dabigatran  = file.path(vec_dir, "dabigatran_vector.rds"),
+  Warfarin    = file.path(vec_dir, "warfarin_vector.rds")
+)
+
+# sanity checks
+missing_files <- c(
+  res_unadj_path[!file.exists(res_unadj_path)],
+  shrunk_path[!file.exists(shrunk_path)],
+  ddi_path[!file.exists(ddi_path)],
+  vec_paths[!file.exists(unlist(vec_paths))]
+)
+if (length(missing_files) > 0) {
+  stop("Missing required file(s):\n  - ", paste(missing_files, collapse = "\n  - "))
+}
+
+# ---- 2) Load data ----
+res_unadj   <- as.data.table(readRDS(res_unadj_path))
+oac_shrunk  <- as.data.table(readRDS(shrunk_path))
+ddi_results <- as.data.table(readRDS(ddi_path))
+
+# Ensure expected columns exist in ddi_results
+needed_ddi_cols <- c("object", "drug",
+                     "irr_oac", "lower_oac", "upper_oac",
+                     "irr_nc",  "lower_nc",  "upper_nc",
+                     "ratio_rr","ratio_lower","ratio_upper",
+                     "ratio_sig_any", "ddi_pattern")
+missing_ddi_cols <- setdiff(needed_ddi_cols, names(ddi_results))
+if (length(missing_ddi_cols) > 0) {
+  stop("ddi_results is missing columns: ",
+       paste(missing_ddi_cols, collapse = ", "))
+}
+
+# Load precipitant vectors (pre-loop "identified" precipitants)
+precip_vectors <- lapply(vec_paths, readRDS)
+names(precip_vectors) <- names(vec_paths)
+
+# ---- 3) Helper: clean numeric ranges as 'a.b–c.d' ----
+range_fmt <- function(x) {
+  x <- x[is.finite(x)]
+  if (!length(x)) return(NA_character_)
+  sprintf("%.2f–%.2f", min(x, na.rm = TRUE), max(x, na.rm = TRUE))
+}
+
+# ---- 4) Build Table 2 (Zhou-style summary) ----
+
+# 4a. # precipitants with RR estimate from SCCS (any non-NA Estimate)
+rr_summary <- res_unadj[is.finite(Estimate),
+                        .(n_with_rr = uniqueN(drug)),
+                        by = object]
+
+# 4b. # included in semi-Bayes (after var_beta / n_exposed filters)
+sb_summary <- oac_shrunk[
+  is.finite(shrunken_irr),
+  .(
+    n_in_sb        = uniqueN(drug),
+    sb_range_irr   = range_fmt(shrunken_irr),
+    n_sig_sb       = sum(sig_any %in% TRUE)
+  ),
+  by = object
+]
+
+# 4c. # precipitants identified (pre-loop vectors)
+id_summary <- rbindlist(lapply(names(precip_vectors), function(obj) {
+  v <- precip_vectors[[obj]]
+  data.table(
+    object          = obj,
+    n_identified    = length(unique(as.character(v)))
+  )
+}), use.names = TRUE, fill = TRUE)
+
+# 4d. RoR summary from DDI screen
+ror_summary <- ddi_results[
+  ,
+  .(
+    n_for_ror     = uniqueN(drug[!is.na(ratio_rr)]),
+    ror_range     = range_fmt(ratio_rr),
+    n_sig_ror     = sum(ratio_sig_any %in% TRUE),
+    # Simple flag for "potential DDI signal":
+    #  - OAC semi-Bayes RR > 1
+    #  - RoR > 1 and significant
+    n_potential_ddi = sum(
+      ratio_sig_any %in% TRUE &
+        irr_oac > 1 &
+        !is.na(ratio_rr) &
+        ratio_rr > 1
+    )
+  ),
+  by = object
+]
+
+# 4e. Merge pieces into one Table 2 dataset
+table2_dt <- id_summary %>%
+  full_join(rr_summary,  by = "object") %>%
+  full_join(sb_summary,  by = "object") %>%
+  full_join(ror_summary, by = "object") %>%
+  arrange(object)
+
+# Nicely labeled / ordered columns
+table2_dt <- table2_dt %>%
+  mutate(
+    object = factor(object,
+                    levels = c("Apixaban","Rivaroxaban","Dabigatran","Warfarin"))
+  ) %>%
+  arrange(object) %>%
+  mutate(object = as.character(object)) %>%
+  select(
+    object,
+    n_identified,
+    n_with_rr,
+    n_in_sb,
+    sb_range_irr,
+    n_sig_sb,
+    n_for_ror,
+    ror_range,
+    n_sig_ror,
+    n_potential_ddi
+  )
+
+# ---- 5) Build Table 3 (detailed DDI candidates) ----
+# Here we keep all rows in ddi_results (you can filter ratio_sig_any == TRUE if desired)
+
+table3_dt <- ddi_results %>%
+  arrange(object, desc(irr_oac)) %>%
+  mutate(
+    irr_oac_ci = sprintf("%.2f (%.2f, %.2f)", irr_oac, lower_oac, upper_oac),
+    irr_nc_ci  = ifelse(
+      is.na(irr_nc),
+      NA_character_,
+      sprintf("%.2f (%.2f, %.2f)", irr_nc, lower_nc, upper_nc)
+    ),
+    ror_ci     = ifelse(
+      is.na(ratio_rr),
+      NA_character_,
+      sprintf("%.2f (%.2f, %.2f)", ratio_rr, ratio_lower, ratio_upper)
+    ),
+    # Placeholder for manual mechanism annotation (edit as needed)
+    mechanism  = ifelse("mechanism" %in% names(ddi_results),
+                        as.character(mechanism),
+                        NA_character_)
+  ) %>%
+  select(
+    object,
+    drug,
+    irr_oac_ci,
+    irr_nc_ci,
+    ror_ci,
+    ddi_pattern,
+    mechanism
+  )
+
+# ---- 6) Save raw tables (CSV/RDS) ----
+out_dir <- file.path(proj_root, "results", "tables")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Table 2
+fwrite(table2_dt, file.path(out_dir, "table2_zhou_style_unadj_prior025.csv"))
+saveRDS(table2_dt, file.path(out_dir, "table2_zhou_style_unadj_prior025.rds"))
+
+# Table 3
+fwrite(table3_dt, file.path(out_dir, "table3_ddi_candidates_unadj_prior025.csv"))
+saveRDS(table3_dt, file.path(out_dir, "table3_ddi_candidates_unadj_prior025.rds"))
+
+# ---- 7) Publication-style GT tables ----
+
+## 7a. GT Table 2
+table2_gt <- table2_dt %>%
+  gt(rowname_col = "object") %>%
+  tab_header(
+    title = "Table 2. Overview of Precipitant Screening by Oral Anticoagulant"
+  ) %>%
+  cols_label(
+    n_identified    = "Number of precipitants identified",
+    n_with_rr       = "Number with RR estimate",
+    n_in_sb         = "Number included in semi-Bayes RR",
+    sb_range_irr    = "Range of semi-Bayes RR",
+    n_sig_sb        = "Number of signif. semi-Bayes RR",
+    n_for_ror       = "Number examined for ratio of RRs",
+    ror_range       = "Range of ratio of RRs",
+    n_sig_ror       = "Number of signif. elevated ratio of RRs",
+    n_potential_ddi = "Number of potential DDI signals*"
+  ) %>%
+  fmt_number(
+    columns = c(n_identified, n_with_rr, n_in_sb,
+                n_sig_sb, n_for_ror, n_sig_ror, n_potential_ddi),
+    decimals = 0
+  ) %>%
+  tab_options(
+    table.font.size = 11,
+    data_row.padding = px(4)
+  ) %>%
+  tab_source_note(
+    source_note = "*Potential DDI signals defined here as precipitants with semi-Bayes RR > 1, " %>%
+      paste0("ratio of RRs > 1, and statistically significant ratio of RRs; ",
+             "this rule can be modified in the code as needed.")
+  )
+
+gtsave(
+  table2_gt,
+  filename = file.path(out_dir, "table2_zhou_style_unadj_prior025.html")
+)
+
+## 7b. GT Table 3
+table3_gt <- table3_dt %>%
+  gt() %>%
+  tab_header(
+    title = "Table 3. Candidate Drug–Drug Interactions with Oral Anticoagulants"
+  ) %>%
+  cols_label(
+    object      = "Oral anticoagulant (object)",
+    drug        = "Precipitant drug",
+    irr_oac_ci  = "OAC semi-Bayes RR (95% CI)",
+    irr_nc_ci   = "NC semi-Bayes RR (95% CI)",
+    ror_ci      = "Ratio of RRs (95% CI)",
+    ddi_pattern = "Pattern (OAC vs NC)",
+    mechanism   = "Potential mechanism"
+  ) %>%
+  tab_options(
+    table.font.size = 10,
+    data_row.padding = px(3)
+  )
+
+gtsave(
+  table3_gt,
+  filename = file.path(out_dir, "table3_ddi_candidates_unadj_prior025.html")
+)
+
+message("Table 2 written to:\n  ",
+        file.path(out_dir, "table2_zhou_style_unadj_prior025.{csv,rds,html}"))
+message("Table 3 written to:\n  ",
+        file.path(out_dir, "table3_ddi_candidates_unadj_prior025.{csv,rds,html}"))
 
 ```
 
