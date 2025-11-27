@@ -2252,402 +2252,9 @@ ddi_unadj_025 <- build_ddi_screen_table(
 
 ```
 
-# Manuscript Tables
-```{r}
-# ============================================
-# Build Zhou-style Tables 2 and 3
-#   - Uses:
-#       proj_root/results/unadjusted_shrunk_prior025.rds
-#       proj_root/results/ratio_of_ratios/ddi_screen_table_unadjusted_prior025.rds
-#   - Produces:
-#       proj_root/results/tables/table2_oac_screen_summary_unadj_prior025.{csv,rds}
-#       proj_root/results/tables/table3_ddi_candidates_unadj_prior025.{csv,rds}
-# ============================================
-
-library(data.table)
-library(dplyr)
-
-# ---- 1) Paths ----
-oac_shrunk_path <- file.path(proj_root, "results", "unadjusted_shrunk_prior025.rds")
-ddi_path        <- file.path(proj_root, "results", "ratio_of_ratios",
-                             "ddi_screen_table_unadjusted_prior025.rds")
-
-if (!file.exists(oac_shrunk_path)) {
-  stop("OAC shrunk file not found: ", oac_shrunk_path)
-}
-
-# ---- 2) Ensure DDI table exists (build if needed) ----
-if (!file.exists(ddi_path)) {
-  if (!exists("build_ddi_screen_table")) {
-    stop(
-      "DDI screen table not found at:\n  ", ddi_path,
-      "\n and build_ddi_screen_table() is not in the environment."
-    )
-  }
-  message("DDI screen table not found; creating via build_ddi_screen_table()...")
-  ddi_unadj_025 <- build_ddi_screen_table(
-    label       = "unadjusted",
-    prior_suffix = "prior025",
-    proj_root   = proj_root,
-    nc_object   = "Lisinopril"
-  )
-}
-
-# Read the DDI table (or reuse if already in memory)
-ddi_results <- if (exists("ddi_unadj_025")) {
-  ddi_unadj_025
-} else {
-  readRDS(ddi_path)
-}
-ddi_results <- as.data.table(ddi_results)
-
-# Read OAC shrunk results
-oac_shrunk <- as.data.table(readRDS(oac_shrunk_path))
-
-# ---- 3) Table 2A: overall OAC screen summary (by OAC object) ----
-#   - Number of precipitants
-#   - Number with an estimate
-#   - Number with significant shrunk RR
-table2_overall <- oac_shrunk[
-  is.finite(shrunken_irr),
-  .(
-    n_precipitants  = uniqueN(drug),
-    n_with_estimate = sum(!is.na(shrunken_irr)),
-    n_sig_shrunk    = sum(sig_any %in% TRUE)
-  ),
-  by = object
-][order(object)]
-
-# ---- 4) Table 2B: summary restricted to OAC hits + RoR (based on ddi_results) ----
-table2_hits <- ddi_results[
-  ,
-  .(
-    n_precipitants_sig_oac = uniqueN(drug),
-    n_sig_ror              = sum(ratio_sig_any %in% TRUE)
-  ),
-  by = object
-][order(object)]
-
-# Merge into a single Table 2
-table2 <- merge(table2_overall, table2_hits, by = "object", all.x = TRUE)
-setorder(table2, object)
-
-# ---- 5) Table 3: detailed DDI candidates (Zhou-style) ----
-# You can uncomment the filter(ratio_sig_any == TRUE) line if you want to
-# restrict to RoR-significant hits only.
-table3 <- ddi_results %>%
-  # Optionally restrict to ratio-of-ratios significant:
-  # filter(ratio_sig_any == TRUE) %>%
-  arrange(object, desc(irr_oac)) %>%
-  mutate(
-    irr_oac_ci = sprintf("%.2f (%.2f, %.2f)", irr_oac, lower_oac, upper_oac),
-    irr_nc_ci  = ifelse(
-      is.na(irr_nc),
-      NA_character_,
-      sprintf("%.2f (%.2f, %.2f)", irr_nc, lower_nc, upper_nc)
-    ),
-    ror_ci     = ifelse(
-      is.na(ratio_rr),
-      NA_character_,
-      sprintf("%.2f (%.2f, %.2f)", ratio_rr, ratio_lower, ratio_upper)
-    ),
-    # Placeholder for manual annotation of DDI mechanism
-    mechanism  = NA_character_
-  ) %>%
-  select(
-    object, drug,
-    irr_oac_ci,
-    irr_nc_ci,
-    ror_ci,
-    ddi_pattern,
-    mechanism
-  )
-
-table3 <- as.data.table(table3)
-
-# ---- 6) Save tables ----
-out_dir <- file.path(proj_root, "results", "tables")
-dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
-
-# Table 2
-fwrite(table2, file.path(out_dir, "table2_oac_screen_summary_unadj_prior025.csv"))
-saveRDS(table2, file.path(out_dir, "table2_oac_screen_summary_unadj_prior025.rds"))
-
-# Table 3
-fwrite(table3, file.path(out_dir, "table3_ddi_candidates_unadj_prior025.csv"))
-saveRDS(table3, file.path(out_dir, "table3_ddi_candidates_unadj_prior025.rds"))
-
-message("Table 2 saved to: ", file.path(out_dir, "table2_oac_screen_summary_unadj_prior025.{csv,rds}"))
-message("Table 3 saved to: ", file.path(out_dir, "table3_ddi_candidates_unadj_prior025.{csv,rds}"))
-
-```
-
-# Manuscript Tables 2
-```{r}
-# ============================================
-# Build Zhou-style Tables 2 & 3 as GT tables
-#   – Uses:
-#       proj_root/results/sccs_results_unadjusted.rds
-#       proj_root/results/unadjusted_shrunk_prior025.rds
-#       proj_root/results/ratio_of_ratios/ddi_screen_table_unadjusted_prior025.rds
-#       proj_root/data/loop_datasets/*_vector.rds
-#   – Produces:
-#       proj_root/results/tables/table2_zhou_style_unadj_prior025.{csv,rds,html}
-#       proj_root/results/tables/table3_ddi_candidates_unadj_prior025.{csv,rds,html}
-# ============================================
-
-suppressPackageStartupMessages({
-  library(data.table)
-  library(dplyr)
-  library(stringr)
-  library(gt)
-})
-
-# ---- 1) Paths ----
-res_unadj_path   <- file.path(proj_root, "results", "sccs_results_unadjusted.rds")
-shrunk_path      <- file.path(proj_root, "results", "unadjusted_shrunk_prior025.rds")
-ddi_path         <- file.path(proj_root, "results", "ratio_of_ratios",
-                              "ddi_screen_table_unadjusted_prior025.rds")
-
-vec_dir          <- file.path(proj_root, "data", "loop_datasets")
-vec_paths <- list(
-  Apixaban    = file.path(vec_dir, "apixaban_vector.rds"),
-  Rivaroxaban = file.path(vec_dir, "rivaroxaban_vector.rds"),
-  Dabigatran  = file.path(vec_dir, "dabigatran_vector.rds"),
-  Warfarin    = file.path(vec_dir, "warfarin_vector.rds")
-)
-
-# sanity checks
-missing_files <- c(
-  res_unadj_path[!file.exists(res_unadj_path)],
-  shrunk_path[!file.exists(shrunk_path)],
-  ddi_path[!file.exists(ddi_path)],
-  vec_paths[!file.exists(unlist(vec_paths))]
-)
-if (length(missing_files) > 0) {
-  stop("Missing required file(s):\n  - ", paste(missing_files, collapse = "\n  - "))
-}
-
-# ---- 2) Load data ----
-res_unadj   <- as.data.table(readRDS(res_unadj_path))
-oac_shrunk  <- as.data.table(readRDS(shrunk_path))
-ddi_results <- as.data.table(readRDS(ddi_path))
-
-# Ensure expected columns exist in ddi_results
-needed_ddi_cols <- c("object", "drug",
-                     "irr_oac", "lower_oac", "upper_oac",
-                     "irr_nc",  "lower_nc",  "upper_nc",
-                     "ratio_rr","ratio_lower","ratio_upper",
-                     "ratio_sig_any", "ddi_pattern")
-missing_ddi_cols <- setdiff(needed_ddi_cols, names(ddi_results))
-if (length(missing_ddi_cols) > 0) {
-  stop("ddi_results is missing columns: ",
-       paste(missing_ddi_cols, collapse = ", "))
-}
-
-# Load precipitant vectors (pre-loop "identified" precipitants)
-precip_vectors <- lapply(vec_paths, readRDS)
-names(precip_vectors) <- names(vec_paths)
-
-# ---- 3) Helper: clean numeric ranges as 'a.b–c.d' ----
-range_fmt <- function(x) {
-  x <- x[is.finite(x)]
-  if (!length(x)) return(NA_character_)
-  sprintf("%.2f–%.2f", min(x, na.rm = TRUE), max(x, na.rm = TRUE))
-}
-
-# ---- 4) Build Table 2 (Zhou-style summary) ----
-
-# 4a. # precipitants with RR estimate from SCCS (any non-NA Estimate)
-rr_summary <- res_unadj[is.finite(Estimate),
-                        .(n_with_rr = uniqueN(drug)),
-                        by = object]
-
-# 4b. # included in semi-Bayes (after var_beta / n_exposed filters)
-sb_summary <- oac_shrunk[
-  is.finite(shrunken_irr),
-  .(
-    n_in_sb        = uniqueN(drug),
-    sb_range_irr   = range_fmt(shrunken_irr),
-    n_sig_sb       = sum(sig_any %in% TRUE)
-  ),
-  by = object
-]
-
-# 4c. # precipitants identified (pre-loop vectors)
-id_summary <- rbindlist(lapply(names(precip_vectors), function(obj) {
-  v <- precip_vectors[[obj]]
-  data.table(
-    object          = obj,
-    n_identified    = length(unique(as.character(v)))
-  )
-}), use.names = TRUE, fill = TRUE)
-
-# 4d. RoR summary from DDI screen
-ror_summary <- ddi_results[
-  ,
-  .(
-    n_for_ror     = uniqueN(drug[!is.na(ratio_rr)]),
-    ror_range     = range_fmt(ratio_rr),
-    n_sig_ror     = sum(ratio_sig_any %in% TRUE),
-    # Simple flag for "potential DDI signal":
-    #  - OAC semi-Bayes RR > 1
-    #  - RoR > 1 and significant
-    n_potential_ddi = sum(
-      ratio_sig_any %in% TRUE &
-        irr_oac > 1 &
-        !is.na(ratio_rr) &
-        ratio_rr > 1
-    )
-  ),
-  by = object
-]
-
-# 4e. Merge pieces into one Table 2 dataset
-table2_dt <- id_summary %>%
-  full_join(rr_summary,  by = "object") %>%
-  full_join(sb_summary,  by = "object") %>%
-  full_join(ror_summary, by = "object") %>%
-  arrange(object)
-
-# Nicely labeled / ordered columns
-table2_dt <- table2_dt %>%
-  mutate(
-    object = factor(object,
-                    levels = c("Apixaban","Rivaroxaban","Dabigatran","Warfarin"))
-  ) %>%
-  arrange(object) %>%
-  mutate(object = as.character(object)) %>%
-  select(
-    object,
-    n_identified,
-    n_with_rr,
-    n_in_sb,
-    sb_range_irr,
-    n_sig_sb,
-    n_for_ror,
-    ror_range,
-    n_sig_ror,
-    n_potential_ddi
-  )
-
-# ---- 5) Build Table 3 (detailed DDI candidates) ----
-# Here we keep all rows in ddi_results (you can filter ratio_sig_any == TRUE if desired)
-
-table3_dt <- ddi_results %>%
-  arrange(object, desc(irr_oac)) %>%
-  mutate(
-    irr_oac_ci = sprintf("%.2f (%.2f, %.2f)", irr_oac, lower_oac, upper_oac),
-    irr_nc_ci  = ifelse(
-      is.na(irr_nc),
-      NA_character_,
-      sprintf("%.2f (%.2f, %.2f)", irr_nc, lower_nc, upper_nc)
-    ),
-    ror_ci     = ifelse(
-      is.na(ratio_rr),
-      NA_character_,
-      sprintf("%.2f (%.2f, %.2f)", ratio_rr, ratio_lower, ratio_upper)
-    ),
-    # Placeholder for manual mechanism annotation (edit as needed)
-    mechanism  = ifelse("mechanism" %in% names(ddi_results),
-                        as.character(mechanism),
-                        NA_character_)
-  ) %>%
-  select(
-    object,
-    drug,
-    irr_oac_ci,
-    irr_nc_ci,
-    ror_ci,
-    ddi_pattern,
-    mechanism
-  )
-
-# ---- 6) Save raw tables (CSV/RDS) ----
-out_dir <- file.path(proj_root, "results", "tables")
-dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
-
-# Table 2
-fwrite(table2_dt, file.path(out_dir, "table2_zhou_style_unadj_prior025.csv"))
-saveRDS(table2_dt, file.path(out_dir, "table2_zhou_style_unadj_prior025.rds"))
-
-# Table 3
-fwrite(table3_dt, file.path(out_dir, "table3_ddi_candidates_unadj_prior025.csv"))
-saveRDS(table3_dt, file.path(out_dir, "table3_ddi_candidates_unadj_prior025.rds"))
-
-# ---- 7) Publication-style GT tables ----
-
-## 7a. GT Table 2
-table2_gt <- table2_dt %>%
-  gt(rowname_col = "object") %>%
-  tab_header(
-    title = "Table 2. Overview of Precipitant Screening by Oral Anticoagulant"
-  ) %>%
-  cols_label(
-    n_identified    = "Number of precipitants identified",
-    n_with_rr       = "Number with RR estimate",
-    n_in_sb         = "Number included in semi-Bayes RR",
-    sb_range_irr    = "Range of semi-Bayes RR",
-    n_sig_sb        = "Number of signif. semi-Bayes RR",
-    n_for_ror       = "Number examined for ratio of RRs",
-    ror_range       = "Range of ratio of RRs",
-    n_sig_ror       = "Number of signif. elevated ratio of RRs",
-    n_potential_ddi = "Number of potential DDI signals*"
-  ) %>%
-  fmt_number(
-    columns = c(n_identified, n_with_rr, n_in_sb,
-                n_sig_sb, n_for_ror, n_sig_ror, n_potential_ddi),
-    decimals = 0
-  ) %>%
-  tab_options(
-    table.font.size = 11,
-    data_row.padding = px(4)
-  ) %>%
-  tab_source_note(
-    source_note = "*Potential DDI signals defined here as precipitants with semi-Bayes RR > 1, " %>%
-      paste0("ratio of RRs > 1, and statistically significant ratio of RRs; ",
-             "this rule can be modified in the code as needed.")
-  )
-
-gtsave(
-  table2_gt,
-  filename = file.path(out_dir, "table2_zhou_style_unadj_prior025.html")
-)
-
-## 7b. GT Table 3
-table3_gt <- table3_dt %>%
-  gt() %>%
-  tab_header(
-    title = "Table 3. Candidate Drug–Drug Interactions with Oral Anticoagulants"
-  ) %>%
-  cols_label(
-    object      = "Oral anticoagulant (object)",
-    drug        = "Precipitant drug",
-    irr_oac_ci  = "OAC semi-Bayes RR (95% CI)",
-    irr_nc_ci   = "NC semi-Bayes RR (95% CI)",
-    ror_ci      = "Ratio of RRs (95% CI)",
-    ddi_pattern = "Pattern (OAC vs NC)",
-    mechanism   = "Potential mechanism"
-  ) %>%
-  tab_options(
-    table.font.size = 10,
-    data_row.padding = px(3)
-  )
-
-gtsave(
-  table3_gt,
-  filename = file.path(out_dir, "table3_ddi_candidates_unadj_prior025.html")
-)
-
-message("Table 2 written to:\n  ",
-        file.path(out_dir, "table2_zhou_style_unadj_prior025.{csv,rds,html}"))
-message("Table 3 written to:\n  ",
-        file.path(out_dir, "table3_ddi_candidates_unadj_prior025.{csv,rds,html}"))
 
 
-```
-
-# Build Table 1  
+# Table 1  
 
 ```{r}
 # =========================
@@ -3383,3 +2990,198 @@ pub_table
 gtsave(pub_table, "C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/results/tables/table1.html")
 
 ```
+
+
+# Table 2 / 3 Generation
+```{r}
+build_manuscript_tables <- function(
+  proj_root,
+  label = "unadjusted",
+  prior_suffix = "prior025"
+) {
+  library(data.table)
+  library(dplyr)
+  library(gt)
+  
+  # --- Paths ---
+  oac_shrunk_path <- file.path(proj_root, "results",
+                               paste0(label, "_shrunk_", prior_suffix, ".rds"))
+  ddi_path <- file.path(proj_root, "results", "ratio_of_ratios",
+                        paste0("ddi_screen_table_", label, "_", prior_suffix, ".rds"))
+  res_unadj_path <- file.path(proj_root, "results",
+                              paste0("sccs_results_", label, ".rds"))
+  vec_dir <- file.path(proj_root, "data", "loop_datasets")
+  
+  stopifnot(file.exists(oac_shrunk_path),
+            file.exists(ddi_path),
+            file.exists(res_unadj_path))
+  
+  vec_paths <- list(
+    Apixaban    = file.path(vec_dir, "apixaban_vector.rds"),
+    Rivaroxaban = file.path(vec_dir, "rivaroxaban_vector.rds"),
+    Dabigatran  = file.path(vec_dir, "dabigatran_vector.rds"),
+    Warfarin    = file.path(vec_dir, "warfarin_vector.rds")
+  )
+  stopifnot(all(file.exists(unlist(vec_paths))))
+  
+  # --- Load data ---
+  oac_shrunk  <- as.data.table(readRDS(oac_shrunk_path))
+  ddi_results <- as.data.table(readRDS(ddi_path))
+  res_unadj   <- as.data.table(readRDS(res_unadj_path))
+  precip_vectors <- lapply(vec_paths, readRDS)
+  names(precip_vectors) <- names(vec_paths)
+  
+  range_fmt <- function(x) {
+    x <- x[is.finite(x)]
+    if (!length(x)) return(NA_character_)
+    sprintf("%.2f–%.2f", min(x), max(x))
+  }
+  
+  # --- Table 2: overview ---
+  
+  # 1) # of precipitants identified (from vectors)
+  id_summary <- rbindlist(lapply(names(precip_vectors), function(obj) {
+    v <- precip_vectors[[obj]]
+    data.table(
+      object       = obj,
+      n_identified = length(unique(as.character(v)))
+    )
+  }))
+  
+  # 2) # with any SCCS RR estimate
+  rr_summary <- res_unadj[is.finite(Estimate),
+                          .(n_with_rr = uniqueN(drug)),
+                          by = object]
+  
+  # 3) # in semi-Bayes + range + # sig shrunk
+  sb_summary <- oac_shrunk[is.finite(shrunken_irr),
+                           .(
+                             n_in_sb      = uniqueN(drug),
+                             sb_range_irr = range_fmt(shrunken_irr),
+                             n_sig_sb     = sum(sig_any %in% TRUE)
+                           ),
+                           by = object]
+  
+  # 4) RoR summary from DDI results
+  ror_summary <- ddi_results[
+    ,
+    .(
+      n_for_ror      = uniqueN(drug[!is.na(ratio_rr)]),
+      ror_range      = range_fmt(ratio_rr),
+      n_sig_ror      = sum(ratio_sig_any %in% TRUE),
+      n_potential_ddi = sum(
+        ratio_sig_any %in% TRUE &
+          irr_oac > 1 & !is.na(ratio_rr) & ratio_rr > 1
+      )
+    ),
+    by = object
+  ]
+  
+  table2 <- id_summary %>%
+    full_join(rr_summary,  by = "object") %>%
+    full_join(sb_summary,  by = "object") %>%
+    full_join(ror_summary, by = "object") %>%
+    mutate(
+      object = factor(object,
+                      levels = c("Apixaban","Dabigatran","Edoxaban","Rivaroxaban","Warfarin"))
+    ) %>%
+    arrange(object) %>%
+    mutate(object = as.character(object)) %>%
+    select(
+      object,
+      n_identified,
+      n_with_rr,
+      n_in_sb,
+      sb_range_irr,
+      n_sig_sb,
+      n_for_ror,
+      ror_range,
+      n_sig_ror,
+      n_potential_ddi
+    )
+  
+  # --- Table 3: candidate DDIs ---
+  table3 <- ddi_results %>%
+    arrange(object, desc(irr_oac)) %>%
+    mutate(
+      irr_oac_ci = sprintf("%.2f (%.2f, %.2f)", irr_oac, lower_oac, upper_oac),
+      irr_nc_ci  = ifelse(
+        is.na(irr_nc),
+        NA_character_,
+        sprintf("%.2f (%.2f, %.2f)", irr_nc, lower_nc, upper_nc)
+      ),
+      ror_ci     = ifelse(
+        is.na(ratio_rr),
+        NA_character_,
+        sprintf("%.2f (%.2f, %.2f)", ratio_rr, ratio_lower, ratio_upper)
+      ),
+      mechanism  = NA_character_
+    ) %>%
+    select(
+      object,
+      drug,
+      irr_oac_ci,
+      irr_nc_ci,
+      ror_ci,
+      ddi_pattern,
+      mechanism
+    )
+  
+  out_dir <- file.path(proj_root, "results", "tables")
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  data.table::fwrite(table2, file.path(out_dir, paste0("table2_overview_", label, "_", prior_suffix, ".csv")))
+  saveRDS(table2, file.path(out_dir, paste0("table2_overview_", label, "_", prior_suffix, ".rds")))
+  
+  data.table::fwrite(table3, file.path(out_dir, paste0("table3_ddi_candidates_", label, "_", prior_suffix, ".csv")))
+  saveRDS(table3, file.path(out_dir, paste0("table3_ddi_candidates_", label, "_", prior_suffix, ".rds")))
+  
+  # GT versions for manuscript
+  table2_gt <- table2 %>%
+    gt(rowname_col = "object") %>%
+    tab_header(
+      title = "Table 2. Overview of Precipitant Screening by Oral Anticoagulant"
+    ) %>%
+    cols_label(
+      n_identified    = "Number of precipitants identified",
+      n_with_rr       = "Number with RR estimate",
+      n_in_sb         = "Number included in semi-Bayes RR",
+      sb_range_irr    = "Range of semi-Bayes RR",
+      n_sig_sb        = "Number of signif. semi-Bayes RR",
+      n_for_ror       = "Number examined for ratio of RRs",
+      ror_range       = "Range of ratio of RRs",
+      n_sig_ror       = "Number of signif. elevated ratio of RRs",
+      n_potential_ddi = "Number of potential DDI signals*"
+    ) %>%
+    tab_source_note(
+      source_note = "*Potential DDI signals defined here as precipitants with semi-Bayes RR > 1, ratio of RRs > 1, and statistically significant ratio of RRs."
+    )
+  
+  table3_gt <- table3 %>%
+    gt() %>%
+    tab_header(
+      title = "Table 3. Candidate Drug–Drug Interactions with Oral Anticoagulants"
+    ) %>%
+    cols_label(
+      object      = "Oral anticoagulant (object)",
+      drug        = "Precipitant drug",
+      irr_oac_ci  = "OAC semi-Bayes RR (95% CI)",
+      irr_nc_ci   = "NC semi-Bayes RR (95% CI)",
+      ror_ci      = "Ratio of RRs (95% CI)",
+      ddi_pattern = "Pattern (OAC vs NC)",
+      mechanism   = "Potential mechanism"
+    )
+  
+  gt::gtsave(table2_gt,
+             file.path(out_dir, paste0("table2_overview_", label, "_", prior_suffix, ".html")))
+  gt::gtsave(table3_gt,
+             file.path(out_dir, paste0("table3_ddi_candidates_", label, "_", prior_suffix, ".html")))
+  
+  invisible(list(table2 = table2, table3 = table3))
+}
+
+## Run after your main pipeline:
+manuscript_tables <- build_manuscript_tables(proj_root, "unadjusted", "prior025")
+
+```
+
