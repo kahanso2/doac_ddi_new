@@ -43,7 +43,16 @@ options(scipen = 999)
 
 oac_drug_list <- c("Warf", "Apix", "Rivarox", "Dabig", "Edoxa")
 
+# Base case:
+USE_GRACE_OBJECT  <- TRUE
+USE_GRACE_PRECIP  <- TRUE
+INCLUDE_WASHOUT   <- FALSE
+ADJUST_30DAY      <- TRUE
 
+# Sensitivity # 1:
+# USE_GRACE_OBJECT  <- FALSE
+# USE_GRACE_PRECIP  <- FALSE
+# INCLUDE_WASHOUT   <- TRUE
 ```
 
 # Clean Drug Data File by Updating Blank NDCs
@@ -202,7 +211,7 @@ all_drug_oac_2009_2021 |> write_parquet(file.path(proj_root, "data", "all_drug_o
 # all_drug_oac_2009_2021 <- read_parquet(file.path(proj_root, "data", "all_drug_oac_2009_2021.parquet"))
 
 # Save unique IDs of oac users
-all_oac_users <- unique(all_drug_oac_2009_2021$ENROLID) # 2,360,604 users
+all_oac_users <- unique(all_drug_oac_2009_2021$ENROLID) # 2,618,363 users
 
 ```
 
@@ -335,11 +344,12 @@ write_parquet(cleaned_drug_data, file.path(proj_root, "data", "cleaned_drug_data
 
 # NEW Function
 postclean_assign_rules_dt <- function(df,
-                                      adherence_multiplier,        # e.g. 0.70 (70% adherent)
+                                      adherence_multiplier = 0.70,        # e.g. 0.70 (70% adherent)
                                       cap              = 30L,
                                       gap_allowed      = 183L,      # 183-day “new user” rule
                                       earliest_index_date = "2009-07-02",
-                                      age_criteria     = 18L) {
+                                      age_criteria     = 18L,
+                                      use_grace = TRUE) {
 
   dt <- as.data.table(df)
 
@@ -362,9 +372,13 @@ postclean_assign_rules_dt <- function(df,
 
   # ---- 1) drug_end_plus_grace ----
   # grace ≈ (1 - adherence) * DAYSUPP, capped by `cap`
+  if (isTRUE(use_grace)) {
   dt[, grace_raw  := as.integer(round(DAYSUPP * (1 - adherence_multiplier)))]
   dt[, grace_days := pmin(grace_raw, cap)]
   dt[, grace_raw  := NULL]
+  } else {
+    dt[, grace_days := 0L]
+  }
 
   dt[, drug_end_plus_grace := SVCDATE + (DAYSUPP - 1L) + grace_days]
 
@@ -411,14 +425,27 @@ postclean_assign_rules_dt <- function(df,
 
 # ======================
 
+# Base case (grace ON)
 all_oac_index <- postclean_assign_rules_dt(
   cleaned_drug_data,
   adherence_multiplier = 0.70,   # 70% adherent -> grace = 30% of DAYSUPP (capped by `cap`)
   cap = 30L,
   gap_allowed = 183L,
   earliest_index_date = "2009-07-02",
-  age_criteria = 18L
+  age_criteria = 18L, 
+  use_grace = USE_GRACE_OBJECT
 )
+# 
+# # Sensitivity (grace OFF)
+# all_oac_index_nograce <- postclean_assign_rules_dt(
+#   cleaned_drug_data,
+#   adherence_multiplier = 1.0,  # value irrelevant if use_grace = FALSE
+#   cap = 0L,
+#   gap_allowed = 183L,
+#   earliest_index_date = "2009-07-02",
+#   age_criteria = 18L,
+#   use_grace = FALSE
+# )
 
 # ── Exclude patients with ≥2 distinct OACs on the *index date* ────────────────
 # Index date is the first OAC fill. We look only at fills on that date and count distinct OAC names.
@@ -568,13 +595,19 @@ dt[, SVCDATE := as.Date(SVCDATE)]
 # Order like arrange()
 setorder(dt, ENROLID, episode_number, SVCDATE)
 
-# By episode
+# By episode: set exhaustion_date + next fill
 dt[, `:=`(
-  exhaustion_date        = SVCDATE + DAYSUPP - 1L,                      # inclusive days supply
-  grace_days             = pmin(round(DAYSUPP * 0.3), 30L),             # cap at 30
-  next_prescription_date = shift(SVCDATE, type = "lead"),               # like lead()
-  next_prescription_drug = shift(GENNME, type = "lead")                 # like lead()
+  exhaustion_date        = SVCDATE + DAYSUPP - 1L,          # inclusive days supply
+  next_prescription_date = shift(SVCDATE, type = "lead"),   # like lead()
+  next_prescription_drug = shift(GENNME, type = "lead")     # like lead()
 ), by = .(ENROLID, episode_number)]
+
+# Grace days controlled by USE_GRACE_OBJECT
+if (isTRUE(USE_GRACE_OBJECT)) {
+  dt[, grace_days := pmin(round(DAYSUPP * 0.3), 30L)]       # 30% grace, cap at 30
+} else {
+  dt[, grace_days := 0L]
+}
 
 # adherence_status
 dt[, adherence_status := fifelse(
@@ -675,65 +708,6 @@ write_parquet(
 # IDs to use downstream
 oac_user_ids <- unique(oac_cohort$ENROLID)
 
-# # ---- Continuous exposure censor (switch or discontinuation) ----
-# cont_exposure <- all_oac_index_ce |>
-#   arrange(ENROLID, episode_number, SVCDATE) |>
-#   group_by(ENROLID, episode_number) |>
-#   mutate(
-#     exhaustion_date         = SVCDATE + DAYSUPP - 1,            # inclusive days supply
-#     grace_days              = round(pmin(DAYSUPP * 0.3, 30)),
-#     next_prescription_date  = lead(SVCDATE),
-#     next_prescription_drug  = lead(GENNME),
-#     adherence_status = case_when(
-#       !is.na(next_prescription_date) &
-#         next_prescription_date <= exhaustion_date + grace_days &
-#         next_prescription_drug == index_med                     ~ "Adherent",
-#       !is.na(next_prescription_date) &
-#         next_prescription_drug != index_med                     ~ "Switched",
-#       TRUE                                                      ~ "Discontinued"
-#     ),
-#     end_date = case_when(
-#       adherence_status == "Adherent"     ~ as.Date(NA),                       # keep going
-#       adherence_status == "Switched"     ~ next_prescription_date - 1L,            # stop at switch
-#       adherence_status == "Discontinued" ~ exhaustion_date + grace_days       # stop at gap end
-#     )
-#   ) |>
-#   # Summarise to the FIRST time exposure must end in the episode
-#   summarise(
-#     discontinuation_or_switch_date = {
-#       x <- end_date[!is.na(end_date)]
-#       if (length(x) == 0L) as.Date(NA) else min(x)
-#     },
-#     .groups = "drop"
-#   )
-# 
-# # ---- Merge back; cap follow-up by enrollment and study end ----
-# study_end <- as.Date("2021-12-31")
-# 
-# all_oac_index_ce_cont_exp <- all_oac_index_ce |>
-#   left_join(cont_exposure, by = c("ENROLID", "episode_number")) |>
-#   group_by(ENROLID, episode_number) |>
-#   mutate(
-#     obj_period_end = pmin(
-#       coalesce(end_cont_enrol, study_end),
-#       coalesce(discontinuation_or_switch_date, study_end),
-#       study_end,
-#       na.rm = TRUE
-#     ), 
-#     follow_up_days = as.integer(obj_period_end - index_date + 1L)
-#   ) |>
-#   ungroup() |>
-#   filter(follow_up_days > 0)
-# 
-# oac_cohort <- all_oac_index_ce_cont_exp |>
-#   distinct(ENROLID, episode_number, index_med, index_date, age_at_index, obj_period_end, follow_up_days)
-# 
-# # Persist & reload if desired
-# write_parquet(oac_cohort, "C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/oac_cohort.parquet")
-# oac_cohort <- read_parquet("C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/oac_cohort.parquet")
-# 
-# # IDs to use downstream
-# oac_user_ids <- unique(oac_cohort$ENROLID)
 
 ```
 
@@ -1114,20 +1088,6 @@ analytic_cohort_oac <- oac_cohort %>%
 analytic_cohort_oac <- analytic_cohort_oac |>
   mutate(object = canon_drug(object))
 
-# analytic_cohort_oac_2 <- analytic_cohort_oac |> 
-#   # group_by(ENROLID) |> 
-#   # filter(episode_number == min(episode_number)) |>  #only allows for minimum episode number for each person (no re-entry)
-#   # ungroup() |> 
-#   mutate(age_group_index = case_when(
-#     age_at_index >= 18 & age_at_index <= 44 ~ "18-44",
-#     age_at_index >= 45 & age_at_index <= 64 ~ "45-64",
-#     age_at_index >= 65 & age_at_index <= 74 ~ "65-74",
-#     age_at_index >= 75 & age_at_index <= 84 ~ "75-84",
-#     age_at_index >= 85 & age_at_index <= 90 ~ "85-90",
-#     age_at_index > 90 ~ ">90",
-#     TRUE ~ "Other"
-#   ))
-
 cohort_ids <- unique(analytic_cohort_oac$ENROLID)
 
 write_rds(analytic_cohort_oac, "C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/analytic_cohort_oac.rds")
@@ -1135,7 +1095,6 @@ write_rds(analytic_cohort_oac, "C:/Users/kahanso2/OneDrive - University of Illin
 analytic_cohort_oac <- read_rds("C:/Users/kahanso2/OneDrive - University of Illinois Chicago/Documents_Backup_Microsoft/doac_ddi_new/data/analytic_cohort_oac.rds")
 
 ```
-
 
 # Generate outcome datasets for each object drug
 
@@ -1229,9 +1188,13 @@ all_drug_full <- bind_rows(ccaed_2009_2021_full, mdcrd_2009_2021_full)
 #############
 
 # Helper: safe grace-days and end date (inclusive)
-compute_daysupp <- function(svcdate, daysupp) {
+compute_daysupp <- function(svcdate, daysupp, use_grace = TRUE, grace_mult = 0.3, cap = 30L) {
   daysupp <- coalesce(as.integer(daysupp), 0L)
-  grace   <- as.integer(round(pmin(daysupp * 0.3, 30)))
+  if (isTRUE(use_grace)) {
+  grace   <- as.integer(round(pmin(daysupp * grace_mult, cap)))
+  } else{
+    grace <- 0L
+  }
   # inclusive supply: + daysupp - 1, then add grace
   as.Date(svcdate) + (daysupp - 1L + grace)
 }
@@ -1265,7 +1228,7 @@ oac_precipitant_processing <- function(oac){
     arrange(ENROLID, SVCDATE) |>
     mutate(
       precip_start = SVCDATE,
-      precip_end   = compute_daysupp(SVCDATE, DAYSUPP)
+      precip_end   = compute_daysupp(SVCDATE, DAYSUPP, use_grace = USE_GRACE_PRECIP, grace_mult = 0.3, cap = 30L)
     ) |>
     filter(precip_start <= obj_period_end & precip_end >= index_date) |>
     mutate(doac = str_detect(GENNME, oac_re)) |>
@@ -1467,7 +1430,7 @@ USE_TEST_VECTOR     <- FALSE    # If TRUE, force all objects to use 'test_vector
 
 # Global knobs
 match_mode      <- "broad"     # "broad" keeps APAP expansions; otherwise "substring" is typical
-include_washout <- TRUE
+include_washout <- INCLUDE_WASHOUT
 washout_days    <- 7L
 
 # ------------ Helpers ------------
@@ -1604,7 +1567,7 @@ build_panel <- function(object_data, object_cohort, outcome_dataset,
   }
 
   # Optional washout exclusion
-  if (!isTRUE(include_washout)) {
+  if (isTRUE(include_washout)) {
     tmp <- copy(base)
     tmp[, last_exp := fifelse(exposed == 1L, day, NA_integer_), by = .(ENROLID, episode_number)]
     tmp[, last_exp := nafill(last_exp, "locf"),                  by = .(ENROLID, episode_number)]
