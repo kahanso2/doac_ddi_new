@@ -39,6 +39,17 @@ oac_drug_list <- c("Warf", "Apix", "Rivarox", "Dabig", "Edoxa")
 neg_control <- "Lisinopril"
 oac_generic <- c("Apixaban", "Rivaroxaban", "Rivaroxaban;Rivaroxaban", "Dabigatran Etexilate Mesylate", "Edoxaban", "Warfarin Sodium")
 
+# Base case:
+USE_GRACE_OBJECT  <- TRUE
+USE_GRACE_PRECIP  <- TRUE
+INCLUDE_WASHOUT   <- FALSE
+ADJUST_30DAY      <- TRUE
+
+# Sensitivity # 1:
+# USE_GRACE_OBJECT  <- FALSE
+# USE_GRACE_PRECIP  <- FALSE
+# INCLUDE_WASHOUT   <- TRUE
+
 ```
 
 # Clean Drug Data File by Updating Blank NDCs from RxNorm API
@@ -321,7 +332,7 @@ write_parquet(cleaned_drug_data, file.path(proj_root, "data", "control", "cleane
 # cleaned_drug_data <- read_parquet(file.path(proj_root, "data", "control", "cleaned_drug_data.parquet"))
 ```
 
-# Test - Assign Index Date - works, but need to compare with other code, which can only be done on OAC. In OAC need to gorup by GENNME I think (see ChatGPT) "Optimize data cleaning"
+# Assign Index Date 
 ```{r}
 
 # ==========================================================
@@ -343,11 +354,12 @@ write_parquet(cleaned_drug_data, file.path(proj_root, "data", "control", "cleane
 # ==========================================================
 
 postclean_assign_rules_dt <- function(df,
-                                      adherence_multiplier,        # e.g. 0.70 (70% adherent)
+                                      adherence_multiplier = 0.70,        # e.g. 0.70 (70% adherent)
                                       cap              = 30L,
                                       gap_allowed      = 183L,      # 183-day “new user” rule
                                       earliest_index_date = "2009-07-02",
-                                      age_criteria     = 18L) {
+                                      age_criteria     = 18L,
+                                      use_grace = TRUE) {
 
   dt <- as.data.table(df)
 
@@ -370,9 +382,13 @@ postclean_assign_rules_dt <- function(df,
 
   # ---- 1) drug_end_plus_grace ----
   # grace ≈ (1 - adherence) * DAYSUPP, capped by `cap`
+  if (isTRUE(use_grace)) {
   dt[, grace_raw  := as.integer(round(DAYSUPP * (1 - adherence_multiplier)))]
   dt[, grace_days := pmin(grace_raw, cap)]
   dt[, grace_raw  := NULL]
+  } else {
+    dt[, grace_days := 0L]
+  }
 
   dt[, drug_end_plus_grace := SVCDATE + (DAYSUPP - 1L) + grace_days]
 
@@ -420,13 +436,15 @@ postclean_assign_rules_dt <- function(df,
 
 # ======================
 
+# Base case (grace ON)
 all_neg_con_index <- postclean_assign_rules_dt(
   cleaned_drug_data,
   adherence_multiplier = 0.70,   # 70% adherent -> grace = 30% of DAYSUPP (capped by `cap`)
   cap = 30L,
   gap_allowed = 183L,
   earliest_index_date = "2009-07-02",
-  age_criteria = 18L
+  age_criteria = 18L, 
+  use_grace = USE_GRACE_OBJECT
 )
 
 
@@ -566,13 +584,19 @@ dt[, SVCDATE := as.Date(SVCDATE)]
 # Order like arrange()
 setorder(dt, ENROLID, episode_number, SVCDATE)
 
-# By episode
+# By episode: set exhaustion_date + next fill
 dt[, `:=`(
-  exhaustion_date        = SVCDATE + DAYSUPP - 1L,                      # inclusive days supply
-  grace_days             = pmin(round(DAYSUPP * 0.3), 30L),             # cap at 30
-  next_prescription_date = shift(SVCDATE, type = "lead"),               # like lead()
-  next_prescription_drug = shift(GENNME, type = "lead")                 # like lead()
+  exhaustion_date        = SVCDATE + DAYSUPP - 1L,          # inclusive days supply
+  next_prescription_date = shift(SVCDATE, type = "lead"),   # like lead()
+  next_prescription_drug = shift(GENNME, type = "lead")     # like lead()
 ), by = .(ENROLID, episode_number)]
+
+# Grace days controlled by USE_GRACE_OBJECT
+if (isTRUE(USE_GRACE_OBJECT)) {
+  dt[, grace_days := pmin(round(DAYSUPP * 0.3), 30L)]       # 30% grace, cap at 30
+} else {
+  dt[, grace_days := 0L]
+}
 
 # adherence_status
 dt[, adherence_status := fifelse(
@@ -1159,9 +1183,13 @@ all_drug_full <- bind_rows(ccaed_2009_2021_full, mdcrd_2009_2021_full)
 #############
 
 # Helper: safe grace-days and end date (inclusive)
-compute_daysupp <- function(svcdate, daysupp) {
+compute_daysupp <- function(svcdate, daysupp, use_grace = TRUE, grace_mult = 0.3, cap = 30L) {
   daysupp <- coalesce(as.integer(daysupp), 0L)
-  grace   <- as.integer(round(pmin(daysupp * 0.3, 30)))
+    if (isTRUE(use_grace)) {
+  grace   <- as.integer(round(pmin(daysupp * grace_mult, cap)))
+  } else{
+    grace <- 0L
+  }
   # inclusive supply: + daysupp - 1, then add grace
   as.Date(svcdate) + (daysupp - 1L + grace)
 }
@@ -1192,7 +1220,7 @@ drug_precipitant_processing <- function(drug){
     arrange(ENROLID, SVCDATE) |>
     mutate(
       precip_start = SVCDATE,
-      precip_end   = compute_daysupp(SVCDATE, DAYSUPP)
+      precip_end   = compute_daysupp(SVCDATE, DAYSUPP, use_grace = USE_GRACE_PRECIP, grace_mult = 0.3, cap = 30L)
     ) |>
     filter(precip_start <= obj_period_end & precip_end >= index_date)
 
@@ -1480,7 +1508,7 @@ add_30d_OLDBIN <- function(dt,
 build_panel <- function(object_data, object_cohort, outcome_dataset,
                         drug_label,
                         match_mode = c("substring","exact","broad"),
-                        include_washout = TRUE, washout_days = 7L,
+                        include_washout = INCLUDE_WASHOUT, washout_days = 7L,
                         exclude_oac_days = TRUE) {
   match_mode <- match.arg(match_mode)
 
@@ -1547,7 +1575,7 @@ build_panel <- function(object_data, object_cohort, outcome_dataset,
   }
 
   # Optional washout exclusion
-  if (!isTRUE(include_washout)) {
+  if (isTRUE(include_washout)) {
     tmp <- copy(base)
     tmp[, last_exp := fifelse(exposed == 1L, day, NA_integer_), by = .(ENROLID, episode_number)]
     tmp[, last_exp := nafill(last_exp, "locf"),                  by = .(ENROLID, episode_number)]
@@ -3182,6 +3210,175 @@ build_manuscript_tables <- function(
 
 ## Run after your main pipeline:
 manuscript_tables <- build_manuscript_tables(proj_root, "unadjusted", "prior025")
+
+```
+
+
+#supplement
+```{r}
+library(data.table)
+library(gt)
+
+# Helper to format RR (95% CI) as a string
+fmt_ci <- function(est, lo, hi) {
+  ifelse(
+    !is.finite(est) | !is.finite(lo) | !is.finite(hi),
+    NA_character_,
+    sprintf("%.2f (%.2f, %.2f)", est, lo, hi)
+  )
+}
+
+# Build big supplement table of ALL OAC×precipitant pairs
+# with:
+#  - OAC semi-Bayes RR (95% CI), unadjusted & adjusted
+#  - NC semi-Bayes RR (95% CI), unadjusted & adjusted
+#  - Ratio of RRs (95% CI), unadjusted & adjusted
+#  - Pattern (OAC vs NC), unadjusted & adjusted
+build_full_supp_ddi_table <- function(
+  proj_root,
+  prior_suffix = "prior025",   # "prior025" or "prior067"
+  nc_object   = "Lisinopril"   # kept for consistency, not directly used here
+) {
+  # ---- 1) Read ratio-of-ratios outputs for unadjusted & adjusted ----
+  ror_unadj_path <- file.path(
+    proj_root, "results", "ratio_of_ratios",
+    paste0("ratio_vs_lisinopril_unadjusted_", prior_suffix, ".rds")
+  )
+  ror_adj_path <- file.path(
+    proj_root, "results", "ratio_of_ratios",
+    paste0("ratio_vs_lisinopril_adjusted_", prior_suffix, ".rds")
+  )
+
+  if (!file.exists(ror_unadj_path)) {
+    stop("Unadjusted ratio-of-ratios file not found: ", ror_unadj_path)
+  }
+  if (!file.exists(ror_adj_path)) {
+    stop("Adjusted ratio-of-ratios file not found: ", ror_adj_path)
+  }
+
+  ror_unadj <- as.data.table(readRDS(ror_unadj_path))
+  ror_adj   <- as.data.table(readRDS(ror_adj_path))
+
+  # Expected columns in each:
+  #   object, drug,
+  #   irr_oac, lower_oac, upper_oac,
+  #   irr_nc,  lower_nc,  upper_nc,
+  #   ratio_rr, ratio_lower, ratio_upper,
+  #   ratio_z, ratio_p, ratio_sig_any,
+  #   ddi_pattern
+
+  needed <- c(
+    "object","drug",
+    "irr_oac","lower_oac","upper_oac",
+    "irr_nc","lower_nc","upper_nc",
+    "ratio_rr","ratio_lower","ratio_upper",
+    "ddi_pattern"
+  )
+
+  if (!all(needed %in% names(ror_unadj))) {
+    stop("Unadjusted RoR table missing: ",
+         paste(setdiff(needed, names(ror_unadj)), collapse = ", "))
+  }
+  if (!all(needed %in% names(ror_adj))) {
+    stop("Adjusted RoR table missing: ",
+         paste(setdiff(needed, names(ror_adj)), collapse = ", "))
+  }
+
+  # ---- 2) Prepare for merge: suffix unadjusted & adjusted columns ----
+  setkey(ror_unadj, object, drug)
+  setkey(ror_adj,   object, drug)
+
+  # Add suffixes by renaming (so we can full join cleanly)
+  setnames(
+    ror_unadj,
+    old = c("irr_oac","lower_oac","upper_oac",
+            "irr_nc","lower_nc","upper_nc",
+            "ratio_rr","ratio_lower","ratio_upper",
+            "ddi_pattern"),
+    new = c("irr_oac_unadj","lower_oac_unadj","upper_oac_unadj",
+            "irr_nc_unadj","lower_nc_unadj","upper_nc_unadj",
+            "ratio_rr_unadj","ratio_lower_unadj","ratio_upper_unadj",
+            "ddi_pattern_unadj")
+  )
+
+  setnames(
+    ror_adj,
+    old = c("irr_oac","lower_oac","upper_oac",
+            "irr_nc","lower_nc","upper_nc",
+            "ratio_rr","ratio_lower","ratio_upper",
+            "ddi_pattern"),
+    new = c("irr_oac_adj","lower_oac_adj","upper_oac_adj",
+            "irr_nc_adj","lower_nc_adj","upper_nc_adj",
+            "ratio_rr_adj","ratio_lower_adj","ratio_upper_adj",
+            "ddi_pattern_adj")
+  )
+
+  # ---- 3) Full outer join on object + drug ----
+  full <- merge(
+    ror_unadj, ror_adj,
+    by = c("object","drug"),
+    all = TRUE
+  )
+
+  # ---- 4) Build formatted columns for the supplement ----
+  supp <- full[
+    order(object, drug),
+    .(
+      `Oral anticoagulant (object)` = object,
+      `Precipitant drug`            = drug,
+
+      `OAC semi-Bayes RR (95% CI), unadjusted` =
+        fmt_ci(irr_oac_unadj, lower_oac_unadj, upper_oac_unadj),
+      `OAC semi-Bayes RR (95% CI), adjusted`   =
+        fmt_ci(irr_oac_adj,   lower_oac_adj,   upper_oac_adj),
+
+      `NC semi-Bayes RR (95% CI), unadjusted`  =
+        fmt_ci(irr_nc_unadj,  lower_nc_unadj,  upper_nc_unadj),
+      `NC semi-Bayes RR (95% CI), adjusted`    =
+        fmt_ci(irr_nc_adj,    lower_nc_adj,    upper_nc_adj),
+
+      `Ratio of RRs (95% CI), unadjusted`      =
+        fmt_ci(ratio_rr_unadj, ratio_lower_unadj, ratio_upper_unadj),
+      `Ratio of RRs (95% CI), adjusted`        =
+        fmt_ci(ratio_rr_adj,   ratio_lower_adj,   ratio_upper_adj),
+
+      `Pattern (OAC vs NC), unadjusted`        = ddi_pattern_unadj,
+      `Pattern (OAC vs NC), adjusted`          = ddi_pattern_adj
+    )
+  ]
+
+  # ---- 5) Save to disk (CSV + RDS + optional GT HTML) ----
+  out_dir <- file.path(proj_root, "results", "tables")
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+  stem <- paste0("supp_full_ddi_", prior_suffix)
+  out_csv <- file.path(out_dir, paste0(stem, ".csv"))
+  out_rds <- file.path(out_dir, paste0(stem, ".rds"))
+  out_html <- file.path(out_dir, paste0(stem, ".html"))
+
+  fwrite(as.data.table(supp), out_csv)
+  saveRDS(supp, out_rds)
+
+  # Giant but pretty GT table for the supplement
+  supp_gt <- supp %>%
+    gt() %>%
+    tab_header(
+      title = "Supplement: Full Semi-Bayes and Ratio-of-Ratios Results for All Evaluated Precipitants"
+    ) %>%
+    tab_options(table.font.size = 10)
+
+  gtsave(supp_gt, out_html)
+
+  message("Supplement table saved to:\n  ", out_csv, "\n  ", out_rds, "\n  ", out_html)
+  invisible(supp)
+}
+
+# Example call (after you've already run compute_ratio_vs_lisinopril for both
+# unadjusted/adjusted and prior025):
+supp_full <- build_full_supp_ddi_table(
+  proj_root   = proj_root,
+  prior_suffix = "prior025"
+)
 
 ```
 
