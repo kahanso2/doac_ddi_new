@@ -1428,6 +1428,12 @@ DROP_SAME_CLASS     <- TRUE    # If adjusting, drop same-class covariate (e.g., 
 USE_CLOGIT_FALLBACK <- TRUE    # If Poisson FE cannot identify, try clogit on eligible strata
 USE_TEST_VECTOR     <- FALSE    # If TRUE, force all objects to use 'test_vector' below
 
+# ------------ Sensitivity toggles ------------
+ONE_EVENT_ONLY    <- FALSE  # keep only first event per (ENROLID, episode_number)
+LEFT_CENSOR       <- FALSE  # drop all days before first exposed day (for this precipitant) per (ENROLID, episode_number)
+RIGHT_CENSOR      <- FALSE  # drop all days after first exposure window END per (ENROLID, episode_number)
+
+
 # Global knobs
 match_mode      <- "broad"     # "broad" keeps APAP expansions; otherwise "substring" is typical
 include_washout <- INCLUDE_WASHOUT
@@ -1550,6 +1556,14 @@ build_panel <- function(object_data, object_cohort, outcome_dataset,
          on = .(ENROLID, episode_number, day >= exp_start, day <= exp_end),
          exposed := 1L]
   }
+  
+    # Pre-compute censoring endpoint from EXPOSURE INTERVALS (needed for RIGHT_CENSOR)
+  censor_end_dt <- NULL
+  if (isTRUE(RIGHT_CENSOR) && nrow(expos)) {
+    censor_end_dt <- expos[, .(censor_end = exp_end[which.min(exp_start)]),
+                           by = .(ENROLID, episode_number)]
+  }
+
 
   # Events (any columns starting with "event")
   ev_cols <- grep("^event", names(outcome_dataset), value = TRUE)
@@ -1566,6 +1580,18 @@ build_panel <- function(object_data, object_cohort, outcome_dataset,
     }
   }
 
+    # ---- Sensitivity 1: keep FIRST event only per (ENROLID, episode_number) ----
+  if (isTRUE(ONE_EVENT_ONLY)) {
+    first_ev <- base[event == 1L,
+                     .(first_event_day = min(day)),
+                     by = .(ENROLID, episode_number)]
+    if (nrow(first_ev)) {
+      base[first_ev, on = .(ENROLID, episode_number), first_event_day := i.first_event_day]
+      base[event == 1L & day != first_event_day, event := 0L]
+      base[, first_event_day := NULL]
+    }
+  }
+
   # Optional washout exclusion
   if (isTRUE(include_washout)) {
     tmp <- copy(base)
@@ -1575,6 +1601,30 @@ build_panel <- function(object_data, object_cohort, outcome_dataset,
         by = .(ENROLID, episode_number)]
     tmp[is.na(washout), washout := 0L]
     base <- tmp[washout == 0L][, `:=`(last_exp = NULL, washout = NULL)]
+  }
+
+  
+    # ---- Sensitivity 2: LEFT censor at first exposed day (per ENROLID, episode_number) ----
+  if (isTRUE(LEFT_CENSOR)) {
+    first_exp <- base[exposed == 1L,
+                      .(first_exp_day = min(day)),
+                      by = .(ENROLID, episode_number)]
+    if (nrow(first_exp)) {
+      base[first_exp, on = .(ENROLID, episode_number), first_exp_day := i.first_exp_day]
+      base <- base[!is.na(first_exp_day) & day >= first_exp_day][, first_exp_day := NULL]
+    } else {
+      base <- base[0]  # never exposed -> will fail later anyway
+    }
+  }
+
+  # ---- Sensitivity 3: RIGHT censor at end of FIRST exposure window (per ENROLID, episode_number) ----
+  if (isTRUE(RIGHT_CENSOR)) {
+    if (!is.null(censor_end_dt) && nrow(censor_end_dt)) {
+      base[censor_end_dt, on = .(ENROLID, episode_number), censor_end := i.censor_end]
+      base <- base[!is.na(censor_end) & day <= censor_end][, censor_end := NULL]
+    } else {
+      base <- base[0]
+    }
   }
 
   # ---- FIXED MERGE (no i.get) ----
@@ -1770,6 +1820,25 @@ res_adj <- readRDS(file.path(proj_root, "results/sccs_results_adjusted.rds"))
 
 # OR (if you prefer CSV)
 # res_adj <- data.table::fread(file.path(proj_root, "results/control/sccs_results_adjusted.csv"))
+
+
+
+
+
+# Sens 1: first event only
+ONE_EVENT_ONLY <- TRUE; LEFT_CENSOR <- FALSE; RIGHT_CENSOR <- FALSE
+res_1event <- run_scan(objs, match_mode, include_washout, washout_days)
+saveRDS(res_1event, file.path(proj_root, "results/sccs_results_1event.rds"))
+
+# Sens 2: left censor
+ONE_EVENT_ONLY <- FALSE; LEFT_CENSOR <- TRUE; RIGHT_CENSOR <- FALSE
+res_left <- run_scan(objs, match_mode, include_washout, washout_days)
+saveRDS(res_left, file.path(proj_root, "results/sccs_results_leftcensor.rds"))
+
+# Sens 3: right censor (first window end)
+ONE_EVENT_ONLY <- FALSE; LEFT_CENSOR <- FALSE; RIGHT_CENSOR <- TRUE; RIGHT_CENSOR_MODE <- "first"
+res_right <- run_scan(objs, match_mode, include_washout, washout_days)
+saveRDS(res_right, file.path(proj_root, "results/sccs_results_rightcensor_first.rds"))
 
 ```
 
