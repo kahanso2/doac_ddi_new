@@ -717,45 +717,58 @@ oac_user_ids <- unique(oac_cohort$ENROLID)
 ```{r}
 
 identify_bleed_outcome <- function(dataset_path_s, dataset_path_i, dataset_path_o, output_path_event) {
-  
-  
-  # --- Collapse Bleed Code Vectors into Regex Strings ---
-  gib_icd9_ind_pattern      <- paste(gib_icd9_ind, collapse = "|")
-  gu_icd9_ind_pattern       <- paste(gu_icd9_ind, collapse = "|")
-  cerebral_icd9_ind_pattern <- paste(cerebral_icd9_ind, collapse = "|")
-  other_icd9_ind_pattern    <- paste(other_icd9_ind, collapse = "|")
-  all_icd9_bleeds_ind_pattern <- paste(all_icd9_bleeds_ind, collapse = "|")
-  
-  gib_icd10_ind_pattern      <- paste(gib_icd10_ind, collapse = "|")
-  gu_icd10_ind_pattern       <- paste(gu_icd10_ind, collapse = "|")
-  cerebral_icd10_ind_pattern <- paste(cerebral_icd10_ind, collapse = "|")
-  other_icd10_ind_pattern    <- paste(other_icd10_ind, collapse = "|")
-  all_icd10_bleeds_ind_pattern <- paste(all_icd10_bleeds_ind, collapse = "|")
-  
-  all_gib_icd9_possible_pattern  <- paste(all_gib_icd9_possible, collapse = "|")
-  all_unspec_icd9_possible_pattern <- paste(all_unspec_icd9_possible, collapse = "|")
-  gu_icd9_possible_pattern         <- gu_icd9_possible  # Already a string
-  
-  all_gib_icd10_possible_pattern  <- paste(all_gib_icd10_possible, collapse = "|")
-  all_unspec_icd10_possible_pattern <- paste(all_unspec_icd10_possible, collapse = "|")
-  
-  all_comb_sec_pattern_icd9  <- paste(all_comb_sec_icd9, collapse = "|")
-  all_comb_sec_pattern_icd10 <- paste(all_comb_sec_icd10, collapse = "|")
-  
-  # (Assume trauma_hcpcs_all and trauma_check_icd9/trauma_check_icd10, etc. are defined externally)
-    oac_user_ids <- as.numeric(oac_user_ids)
+
+  # --- Collapse bleed code vectors into regex strings ---
+  gib_icd9_ind_pattern       <- paste(gib_icd9_ind, collapse="|")
+  gu_icd9_ind_pattern        <- paste(gu_icd9_ind, collapse="|")
+  cerebral_icd9_ind_pattern  <- paste(cerebral_icd9_ind, collapse="|")
+  other_icd9_ind_pattern     <- paste(other_icd9_ind, collapse="|")
+
+  gib_icd10_ind_pattern      <- paste(gib_icd10_ind, collapse="|")
+  gu_icd10_ind_pattern       <- paste(gu_icd10_ind, collapse="|")
+  cerebral_icd10_ind_pattern <- paste(cerebral_icd10_ind, collapse="|")
+  other_icd10_ind_pattern    <- paste(other_icd10_ind, collapse="|")
+
+  # IMPORTANT: these are already regex strings in your codebook
+  all_icd9_bleeds_ind_pattern   <- all_icd9_bleeds_ind
+  all_icd10_bleeds_ind_pattern  <- all_icd10_bleeds_ind
+
+  all_gib_icd9_possible_pattern     <- all_gib_icd9_possible
+  all_unspec_icd9_possible_pattern  <- all_unspec_icd9_possible
+  gu_icd9_possible_pattern          <- gu_icd9_possible
+
+  all_gib_icd10_possible_pattern    <- all_gib_icd10_possible
+  all_unspec_icd10_possible_pattern <- all_unspec_icd10_possible
+
+  all_comb_sec_pattern_icd9         <- all_comb_sec_icd9
+  all_comb_sec_pattern_icd10        <- all_comb_sec_icd10
+
+  # --- Site patterns (GI includes definite+possible; GU includes definite+possible for ICD-9 only) ---
+  gib_icd9_site_pattern  <- paste(c(gib_icd9_ind,  gib_icd9_possible),  collapse="|")
+  gib_icd10_site_pattern <- paste(c(gib_icd10_ind, gib_icd10_possible), collapse="|")
+
+  gu_icd9_site_pattern   <- paste(c(gu_icd9_ind, gu_icd9_possible), collapse="|")
+  gu_icd10_site_pattern  <- gu_icd10_ind_pattern  # no ICD-10 "possible" GU list in your codebook
+
+  # (Assume trauma_hcpcs_all and trauma_check_* are defined externally)
+  oac_user_ids <- as.numeric(oac_user_ids)
+
   # =========================================================================
-  # 1. LOAD TRANSFUSION DATA 
+  # 1. LOAD TRANSFUSION DATA
   transfusion_data <- open_dataset(dataset_path_s) %>%
     select(ENROLID, YEAR, ADMDATE, DISDATE, REVCODE) %>%
     filter(ENROLID %in% oac_user_ids) %>%
     collect() %>%
     mutate(REVCODE3 = substr(REVCODE, 1, 3)) %>%
     filter(REVCODE3 %in% c("038","039")) %>%
-    transmute(ENROLID, YEAR, ADMDATE = as.Date(ADMDATE), DISDATE = as.Date(DISDATE),
-              transfusion_code = 1L) %>%
+    transmute(
+      ENROLID, YEAR,
+      ADMDATE = as.Date(ADMDATE),
+      DISDATE = as.Date(DISDATE),
+      transfusion_code = 1L
+    ) %>%
     distinct()
-  
+
   # =========================================================================
   # 2. LOAD INPATIENT DATA & MERGE TRANSFUSION INFO
   inpatient_data <- open_dataset(dataset_path_i, unify_schemas = TRUE) %>%
@@ -763,23 +776,23 @@ identify_bleed_outcome <- function(dataset_path_s, dataset_path_i, dataset_path_
     filter(ENROLID %in% oac_user_ids) %>%
     collect() %>%
     left_join(transfusion_data, by = c("ENROLID", "YEAR", "ADMDATE", "DISDATE")) %>%
-    mutate(PDX = coalesce(PDX, DX1)) |> 
+    mutate(PDX = coalesce(PDX, DX1)) %>%
     mutate(
-      DXVER = case_when(
+      DXVER = dplyr::case_when(
         DXVER %in% c("0","9") ~ as.numeric(DXVER),
         is.na(DXVER) & ADMDATE >= as.Date("2015-10-01") ~ 0,
         is.na(DXVER) & ADMDATE <  as.Date("2015-10-01") ~ 9,
         TRUE ~ suppressWarnings(as.numeric(DXVER))
-    )) |> 
-    filter(!is.na(DXVER)) |> 
-    # Unite secondary diagnosis columns for vectorized matching.
+      )
+    ) %>%
+    filter(!is.na(DXVER)) %>%
     mutate(across(c(PDX, DX1:DX15, PROC1:PROC15), as.character))
-  
+
   # =========================================================================
-  # 3. IDENTIFY BLEED EVENTS WITH NUANCED RULES
+  # 3. IDENTIFY BLEED EVENTS + ASSIGN SITE (PDX first; for possible bleeds, fallback to secondary dx)
   sec_dx_cols <- paste0("DX", 2:15)
-  proc_cols <- paste0("PROC", 1:15)
-  
+  proc_cols   <- paste0("PROC", 1:15)
+
   inpatient_bleed <- inpatient_data %>%
     mutate(
       definite_bleed = case_when(
@@ -788,167 +801,211 @@ identify_bleed_outcome <- function(dataset_path_s, dataset_path_i, dataset_path_
         TRUE ~ FALSE
       ),
       possible_bleed = case_when(
-        DXVER == 9 ~ ( str_detect(PDX, all_gib_icd9_possible_pattern) | 
-                        str_detect(PDX, all_unspec_icd9_possible_pattern) | 
-                        str_detect(PDX, gu_icd9_possible_pattern) ),
-        DXVER == 0 ~ ( str_detect(PDX, all_gib_icd10_possible_pattern) | 
-                        str_detect(PDX, all_unspec_icd10_possible_pattern) ),
+        DXVER == 9 ~ (
+          str_detect(PDX, all_gib_icd9_possible_pattern) |
+            str_detect(PDX, all_unspec_icd9_possible_pattern) |
+            str_detect(PDX, gu_icd9_possible_pattern)
+        ),
+        DXVER == 0 ~ (
+          str_detect(PDX, all_gib_icd10_possible_pattern) |
+            str_detect(PDX, all_unspec_icd10_possible_pattern)
+        ),
         TRUE ~ FALSE
       ),
-      
-      has_sec_bleed_icd9   = if_any(all_of(sec_dx_cols), ~ str_detect(.x, all_icd9_bleeds_ind_pattern)),
-      has_sec_bleed_icd10  = if_any(all_of(sec_dx_cols), ~ str_detect(.x, all_icd10_bleeds_ind_pattern)),
-      has_icd9_comb        = if_any(all_of(sec_dx_cols), ~ str_detect(.x, all_comb_sec_pattern_icd9)),
-      has_icd10_comb       = if_any(all_of(sec_dx_cols), ~ str_detect(.x, all_comb_sec_pattern_icd10)),
-      
+
+      has_sec_bleed_icd9  = if_any(all_of(sec_dx_cols), ~ str_detect(.x, all_icd9_bleeds_ind_pattern)),
+      has_sec_bleed_icd10 = if_any(all_of(sec_dx_cols), ~ str_detect(.x, all_icd10_bleeds_ind_pattern)),
+      has_icd9_comb       = if_any(all_of(sec_dx_cols), ~ str_detect(.x, all_comb_sec_pattern_icd9)),
+      has_icd10_comb      = if_any(all_of(sec_dx_cols), ~ str_detect(.x, all_comb_sec_pattern_icd10)),
+
       confirmatory = case_when(
-        DXVER == 9 & str_detect(PDX, all_unspec_icd9_possible_pattern) ~ has_sec_bleed_icd9,
+        DXVER == 9 & str_detect(PDX, all_unspec_icd9_possible_pattern)  ~ has_sec_bleed_icd9,
         DXVER == 0 & str_detect(PDX, all_unspec_icd10_possible_pattern) ~ has_sec_bleed_icd10,
-        DXVER == 9 & str_detect(PDX, gu_icd9_possible_pattern) ~ has_icd9_comb,
+        DXVER == 9 & str_detect(PDX, gu_icd9_possible_pattern)          ~ has_icd9_comb,
         DXVER == 9 ~ (has_sec_bleed_icd9  | !is.na(transfusion_code)),
         DXVER == 0 ~ (has_sec_bleed_icd10 | !is.na(transfusion_code)),
         TRUE ~ FALSE
-        ),
-      
+      ),
+
       bleed_code = (definite_bleed | (possible_bleed & confirmatory)),
-      
-      bleed_GI    = if_else(DXVER == 9, str_detect(PDX, gib_icd9_ind_pattern),
-                             if_else(DXVER == 0, str_detect(PDX, gib_icd10_ind_pattern), FALSE)),
-      bleed_GU    = if_else(DXVER == 9, str_detect(PDX, gu_icd9_ind_pattern),
-                             if_else(DXVER == 0, str_detect(PDX, gu_icd10_ind_pattern), FALSE)),
-      bleed_CNS   = if_else(DXVER == 9, str_detect(PDX, cerebral_icd9_ind_pattern),
-                             if_else(DXVER == 0, str_detect(PDX, cerebral_icd10_ind_pattern), FALSE)),
-      bleed_Other = if_else(DXVER == 9, str_detect(PDX, other_icd9_ind_pattern),
-                             if_else(DXVER == 0, str_detect(PDX, other_icd10_ind_pattern), FALSE))
-    ) %>%
-    mutate(
+
+      # ---- principal-site flags ----
+      p_gi = case_when(
+        DXVER == 9 ~ str_detect(PDX, gib_icd9_site_pattern),
+        DXVER == 0 ~ str_detect(PDX, gib_icd10_site_pattern),
+        TRUE ~ FALSE
+      ),
+      p_gu = case_when(
+        DXVER == 9 ~ str_detect(PDX, gu_icd9_site_pattern),
+        DXVER == 0 ~ str_detect(PDX, gu_icd10_site_pattern),
+        TRUE ~ FALSE
+      ),
+      p_cns = case_when(
+        DXVER == 9 ~ str_detect(PDX, cerebral_icd9_ind_pattern),
+        DXVER == 0 ~ str_detect(PDX, cerebral_icd10_ind_pattern),
+        TRUE ~ FALSE
+      ),
+      p_other = case_when(
+        DXVER == 9 ~ str_detect(PDX, other_icd9_ind_pattern),
+        DXVER == 0 ~ str_detect(PDX, other_icd10_ind_pattern),
+        TRUE ~ FALSE
+      ),
+
+      # ---- secondary-site flags (used ONLY for possible bleeds) ----
+      s_gi = case_when(
+        DXVER == 9 ~ if_any(all_of(sec_dx_cols), ~ str_detect(.x, gib_icd9_site_pattern)),
+        DXVER == 0 ~ if_any(all_of(sec_dx_cols), ~ str_detect(.x, gib_icd10_site_pattern)),
+        TRUE ~ FALSE
+      ),
+      s_gu = case_when(
+        DXVER == 9 ~ if_any(all_of(sec_dx_cols), ~ str_detect(.x, gu_icd9_site_pattern)),
+        DXVER == 0 ~ if_any(all_of(sec_dx_cols), ~ str_detect(.x, gu_icd10_site_pattern)),
+        TRUE ~ FALSE
+      ),
+      s_cns = case_when(
+        DXVER == 9 ~ if_any(all_of(sec_dx_cols), ~ str_detect(.x, cerebral_icd9_ind_pattern)),
+        DXVER == 0 ~ if_any(all_of(sec_dx_cols), ~ str_detect(.x, cerebral_icd10_ind_pattern)),
+        TRUE ~ FALSE
+      ),
+      s_other = case_when(
+        DXVER == 9 ~ if_any(all_of(sec_dx_cols), ~ str_detect(.x, other_icd9_ind_pattern)),
+        DXVER == 0 ~ if_any(all_of(sec_dx_cols), ~ str_detect(.x, other_icd10_ind_pattern)),
+        TRUE ~ FALSE
+      ),
+
+      # ---- final site assignment ----
       bleed_site = case_when(
-        bleed_GI ~ "GI",
-        bleed_GU ~ "GU",
-        bleed_CNS ~ "CNS",
-        bleed_Other ~ "Other",
-        TRUE ~ NA_character_
+        p_gi ~ "GI",
+        p_gu ~ "GU",
+        p_cns ~ "CNS",
+        p_other ~ "Other",
+        possible_bleed & s_gi ~ "GI",
+        possible_bleed & s_gu ~ "GU",
+        possible_bleed & s_cns ~ "CNS",
+        possible_bleed & s_other ~ "Other",
+        TRUE ~ "Unspecified"
       )
     ) %>%
     filter(bleed_code)
-  
+
   # =========================================================================
   # 4. IDENTIFY TRAUMA EVENTS WITH SITE ASSIGNMENT (INPATIENT)
-  
- inpatient_trauma <- inpatient_bleed %>%
-  mutate(
-    # any trauma dx (principal or secondary) or trauma HCPCS in any PROC field
-    has_trauma_icd9  = if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd9)),
-    has_trauma_icd10 = if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd10)),
-    has_trauma_hcpcs = if_any(all_of(proc_cols),            ~ str_detect(.x, trauma_hcpcs_all)),
+  inpatient_trauma <- inpatient_bleed %>%
+    mutate(
+      has_trauma_icd9  = if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd9)),
+      has_trauma_icd10 = if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd10)),
+      has_trauma_hcpcs = if_any(all_of(proc_cols), ~ str_detect(.x, trauma_hcpcs_all)),
 
-    trauma_code = case_when(
-      DXVER == 9 ~ (has_trauma_icd9  | has_trauma_hcpcs),
-      DXVER == 0 ~ (has_trauma_icd10 | has_trauma_hcpcs),
-      TRUE ~ FALSE
-    ),
+      trauma_code = case_when(
+        DXVER == 9 ~ (has_trauma_icd9  | has_trauma_hcpcs),
+        DXVER == 0 ~ (has_trauma_icd10 | has_trauma_hcpcs),
+        TRUE ~ FALSE
+      ),
 
-    # site assignment using the same per-field logic
-    trauma_site = case_when(
-      DXVER == 9 & if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd9_GI))    ~ "GI",
-      DXVER == 9 & if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd9_GU))    ~ "GU",
-      DXVER == 9 & if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd9_CNS))   ~ "CNS",
-      DXVER == 9 & if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd9_Other)) ~ "Other",
-      DXVER == 0 & if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd10_GI))   ~ "GI",
-      DXVER == 0 & if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd10_GU))   ~ "GU",
-      DXVER == 0 & if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd10_CNS))  ~ "CNS",
-      DXVER == 0 & if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd10_Other))~ "Other",
-      TRUE ~ NA_character_
-    )
-  ) %>%
-  transmute(ENROLID,
-              ADMDATE = as.Date(ADMDATE),
-              trauma_code, trauma_site) %>%
+      trauma_site = case_when(
+        DXVER == 9 & if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd9_GI))    ~ "GI",
+        DXVER == 9 & if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd9_GU))    ~ "GU",
+        DXVER == 9 & if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd9_CNS))   ~ "CNS",
+        DXVER == 9 & if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd9_Other)) ~ "Other",
+        DXVER == 0 & if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd10_GI))   ~ "GI",
+        DXVER == 0 & if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd10_GU))   ~ "GU",
+        DXVER == 0 & if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd10_CNS))  ~ "CNS",
+        DXVER == 0 & if_any(c("PDX", all_of(sec_dx_cols)), ~ str_detect(.x, trauma_check_icd10_Other))~ "Other",
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    transmute(
+      ENROLID,
+      trauma_date = as.Date(ADMDATE),
+      trauma_site,
+      trauma_code
+    ) %>%
     filter(trauma_code, !is.na(trauma_site)) %>%
-    mutate(trauma_date = ADMDATE) %>%
     select(ENROLID, trauma_date, trauma_site)
-  
-  
+
   # =========================================================================
   # 5. IDENTIFY TRAUMA EVENTS WITH SITE ASSIGNMENT (OUTPATIENT)
   bleed_ids <- unique(inpatient_bleed$ENROLID)
-  
+
   outpatient_data <- open_dataset(dataset_path_o, unify_schemas = TRUE) %>%
     select(ENROLID, SVCDATE, DXVER, DX1, DX2, DX3, DX4, PROC1) %>%
     filter(ENROLID %in% bleed_ids) %>%
     collect() %>%
     mutate(
-    DXVER = case_when(
-      DXVER %in% c("0","9") ~ as.numeric(DXVER),
-      is.na(DXVER) & SVCDATE >= as.Date("2015-10-01") ~ 0,
-      is.na(DXVER) & SVCDATE <  as.Date("2015-10-01") ~ 9,
-      TRUE ~ suppressWarnings(as.numeric(DXVER))
-    )
-  ) %>%
-  filter(!is.na(DXVER)) %>%
-  mutate(across(c(DX1, DX2, DX3, DX4, PROC1), as.character))
+      DXVER = case_when(
+        DXVER %in% c("0","9") ~ as.numeric(DXVER),
+        is.na(DXVER) & SVCDATE >= as.Date("2015-10-01") ~ 0,
+        is.na(DXVER) & SVCDATE <  as.Date("2015-10-01") ~ 9,
+        TRUE ~ suppressWarnings(as.numeric(DXVER))
+      )
+    ) %>%
+    filter(!is.na(DXVER)) %>%
+    mutate(across(c(DX1, DX2, DX3, DX4, PROC1), as.character))
 
-out_dx_cols <- paste0("DX", 1:4)
+  out_dx_cols <- paste0("DX", 1:4)
 
-outpatient_trauma <- outpatient_data %>%
-  mutate(
-    has_trauma_icd9  = if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd9)),
-    has_trauma_icd10 = if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd10)),
-    has_trauma_hcpcs = str_detect(PROC1, trauma_hcpcs_all),
+  outpatient_trauma <- outpatient_data %>%
+    mutate(
+      has_trauma_icd9  = if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd9)),
+      has_trauma_icd10 = if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd10)),
+      has_trauma_hcpcs = str_detect(PROC1, trauma_hcpcs_all),
 
-    trauma_code = case_when(
-      DXVER == 9 ~ (has_trauma_icd9  | has_trauma_hcpcs),
-      DXVER == 0 ~ (has_trauma_icd10 | has_trauma_hcpcs),
-      TRUE ~ FALSE
-    ),
+      trauma_code = case_when(
+        DXVER == 9 ~ (has_trauma_icd9  | has_trauma_hcpcs),
+        DXVER == 0 ~ (has_trauma_icd10 | has_trauma_hcpcs),
+        TRUE ~ FALSE
+      ),
 
-    trauma_site = case_when(
-      DXVER == 9 & if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd9_GI))    ~ "GI",
-      DXVER == 9 & if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd9_GU))    ~ "GU",
-      DXVER == 9 & if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd9_CNS))   ~ "CNS",
-      DXVER == 9 & if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd9_Other)) ~ "Other",
-      DXVER == 0 & if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd10_GI))   ~ "GI",
-      DXVER == 0 & if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd10_GU))   ~ "GU",
-      DXVER == 0 & if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd10_CNS))  ~ "CNS",
-      DXVER == 0 & if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd10_Other))~ "Other",
-      TRUE ~ NA_character_
-    )
-  ) %>%
-  transmute(ENROLID,
-              trauma_date = as.Date(SVCDATE),
-              trauma_code, trauma_site) %>%
-    filter(trauma_code, !is.na(trauma_site))
-  
+      trauma_site = case_when(
+        DXVER == 9 & if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd9_GI))    ~ "GI",
+        DXVER == 9 & if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd9_GU))    ~ "GU",
+        DXVER == 9 & if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd9_CNS))   ~ "CNS",
+        DXVER == 9 & if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd9_Other)) ~ "Other",
+        DXVER == 0 & if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd10_GI))   ~ "GI",
+        DXVER == 0 & if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd10_GU))   ~ "GU",
+        DXVER == 0 & if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd10_CNS))  ~ "CNS",
+        DXVER == 0 & if_any(all_of(out_dx_cols), ~ str_detect(.x, trauma_check_icd10_Other))~ "Other",
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    transmute(
+      ENROLID,
+      trauma_date = as.Date(SVCDATE),
+      trauma_site,
+      trauma_code
+    ) %>%
+    filter(trauma_code, !is.na(trauma_site)) %>%
+    select(ENROLID, trauma_date, trauma_site)
+
   # =========================================================================
   # 6. COMBINE ALL TRAUMA EVENTS
   all_trauma_codes <- bind_rows(inpatient_trauma, outpatient_trauma) %>%
     distinct() %>%
     arrange(ENROLID, trauma_date)
-  
+
   # =========================================================================
-  # 7. MERGE TRAUMA WITH BLEED EVENTS FOR EXCLUSION
-  # Exclude a bleed if a trauma event with matching site occurs within ADMDATE-1 to ADMDATE+1.
+  # 7. EXCLUDE BLEEDS IF MATCHING-SITE TRAUMA WITHIN ±1 DAY
   inpatient_bleed_trauma_merged <- inpatient_bleed %>%
     mutate(ADMDATE = as.Date(ADMDATE)) %>%
-  left_join(all_trauma_codes, by = "ENROLID") %>%
-  mutate(
-    within_window = between(trauma_date, ADMDATE - 1, ADMDATE + 1),
-    trauma_match  = (!is.na(bleed_site) & bleed_site == trauma_site)
-  ) %>%
-  filter(within_window, trauma_match) %>%
-  distinct(ENROLID, ADMDATE) %>%
-  mutate(exclusion_event = 1L)
-  
+    left_join(all_trauma_codes, by = "ENROLID") %>%
+    mutate(
+      within_window = dplyr::between(trauma_date, ADMDATE - 1, ADMDATE + 1),
+      trauma_match  = (bleed_site %in% c("GI","GU","CNS","Other") & bleed_site == trauma_site)
+    ) %>%
+    filter(within_window, trauma_match) %>%
+    distinct(ENROLID, ADMDATE) %>%
+    mutate(exclusion_event = 1L)
+
   # =========================================================================
-  # 8. EXCLUDE TRAUMA-RELATED BLEED EVENTS AND SAVE FINAL OUTCOME
+  # 8. FINAL OUTCOME (NO TRAUMA) + SAVE
   bleed_outcome_no_trauma <- inpatient_bleed %>%
     left_join(inpatient_bleed_trauma_merged, by = c("ENROLID", "ADMDATE")) %>%
-    filter(bleed_code) %>%
-    filter(is.na(exclusion_event)) |> 
-  select(ENROLID, ADMDATE, DISDATE, DAYS, DXVER, PDX, starts_with("DX"), starts_with("PROC"),
-           bleed_site)
-  
-  # Persist
+    filter(is.na(exclusion_event)) %>%
+    select(
+      ENROLID, ADMDATE, DISDATE, DAYS, DXVER, PDX, starts_with("DX"), starts_with("PROC"),
+      bleed_site
+    )
+
   write_parquet(bleed_outcome_no_trauma, output_path_event)
   invisible(bleed_outcome_no_trauma)
 }
